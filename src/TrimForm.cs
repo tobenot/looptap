@@ -44,6 +44,7 @@ namespace LoopTap
         int _loopGen;
         bool _loopBusy;
         bool _suppress;
+        bool _usedLoop;
 
         public TrimForm(string path)
         {
@@ -490,6 +491,7 @@ namespace LoopTap
             if (e > _info.Frames) e = _info.Frames;
             if (e <= s) return;
             _justSaved = false;
+            _usedLoop = true;
             _start = s;
             _end = e;
             _phaseFrames = s;
@@ -639,7 +641,8 @@ namespace LoopTap
                 try { dlg.InitialDirectory = Path.GetDirectoryName(path); }
                 catch { }
                 string baseName = Path.GetFileNameWithoutExtension(path);
-                dlg.FileName = baseName + "_裁剪.wav";
+                string suffix = _usedLoop ? "_循环一遍" : "_裁剪";
+                dlg.FileName = WavCut.ChooseFree(Path.GetDirectoryName(path), baseName, suffix, ".wav");
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
                 dest = dlg.FileName;
                 if (string.Equals(Path.GetFullPath(dest), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase))

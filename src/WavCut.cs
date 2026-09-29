@@ -642,6 +642,24 @@ namespace LoopTap
             throw new InvalidOperationException("备份文件太多。");
         }
 
+        // 另存为的默认名：<原名><后缀>.wav，撞名加序号（原名_裁剪2.wav、原名_裁剪3.wav…）
+        public static string ChooseFree(string dir, string baseName, string suffix, string ext)
+        {
+            Func<string, string> join = delegate(string name)
+            {
+                try { return Path.Combine(dir ?? "", name + ext); }
+                catch { return name + ext; }
+            };
+            string first = baseName + suffix;
+            if (!File.Exists(join(first))) return first;
+            for (int i = 2; i < 1000; i++)
+            {
+                string numbered = baseName + suffix + i;
+                if (!File.Exists(join(numbered))) return numbered;
+            }
+            return baseName + suffix + DateTime.Now.ToString("HHmmss");
+        }
+
         public static void SaveRange(WavInfo info, long start, long end, string dest)
         {
             if (start < 0 || end > info.Frames || end <= start)
