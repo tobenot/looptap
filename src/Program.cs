@@ -445,7 +445,6 @@ namespace LoopTap
                 SetForegroundWindow(hwnd);
                 return false;
             }, IntPtr.Zero);
-            MessageBox.Show("LoopTap 已经在运行。", "LoopTap");
         }
 
         delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lparam);
