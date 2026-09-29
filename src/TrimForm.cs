@@ -1,5 +1,7 @@
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -17,6 +19,12 @@ namespace LoopTap
         readonly Button _align;
         readonly Button _save;
         readonly Button _saveAs;
+        readonly Button _findLoop;
+        readonly Button _oneLoop;
+        readonly TextBox _periodBox;
+        readonly Label _secLabel;
+        readonly CheckBox _gridOn;
+        readonly Label _loopInfo;
         readonly System.Windows.Forms.Timer _playTimer;
         readonly ManualResetEvent _playDone = new ManualResetEvent(true);
         string _path;
@@ -31,6 +39,11 @@ namespace LoopTap
         bool _justSaved;
         bool _saving;
         string _savedExtra;
+        long _periodFrames;
+        long _phaseFrames;
+        int _loopGen;
+        bool _loopBusy;
+        bool _suppress;
 
         public TrimForm(string path)
         {
@@ -47,6 +60,7 @@ namespace LoopTap
 
             _wave = new WavePanel();
             _wave.RangeChanged += delegate { OnRangeChanged(); };
+            _wave.LoopChanged += delegate { OnLoopDragged(); };
 
             _play = new Button();
             _play.Text = "试听选区";
@@ -81,26 +95,85 @@ namespace LoopTap
             _saveAs.Enabled = false;
             _saveAs.Click += delegate { SaveCut(false); };
 
+            _findLoop = new Button();
+            _findLoop.Text = "找循环";
+            _findLoop.Left = 8;
+            _findLoop.Top = 44;
+            _findLoop.Width = 90;
+            _findLoop.Height = 30;
+            _findLoop.Enabled = false;
+            _findLoop.Click += delegate { BeginFind(); };
+
+            _periodBox = new TextBox();
+            _periodBox.Left = 106;
+            _periodBox.Top = 48;
+            _periodBox.Width = 72;
+            _periodBox.Height = 22;
+            _periodBox.KeyDown += delegate(object s, KeyEventArgs ev)
+            {
+                if (ev.KeyCode != Keys.Enter) return;
+                ev.SuppressKeyPress = true;
+                ApplyPeriodText();
+            };
+            _periodBox.Leave += delegate { ApplyPeriodText(); };
+
+            _secLabel = new Label();
+            _secLabel.AutoSize = true;
+            _secLabel.Text = "秒";
+            _secLabel.Left = 182;
+            _secLabel.Top = 52;
+
+            _oneLoop = new Button();
+            _oneLoop.Text = "选区=一个周期";
+            _oneLoop.Top = 44;
+            _oneLoop.Width = 138;
+            _oneLoop.Height = 30;
+            _oneLoop.Enabled = false;
+            _oneLoop.Click += delegate { SelectOneLoop(); };
+
+            _gridOn = new CheckBox();
+            _gridOn.Text = "周期网格";
+            _gridOn.AutoSize = true;
+            _gridOn.Top = 50;
+            _gridOn.CheckedChanged += delegate
+            {
+                if (_suppress) return;
+                PushLoop();
+            };
+
+            _loopInfo = new Label();
+            _loopInfo.AutoSize = false;
+            _loopInfo.AutoEllipsis = true;
+            _loopInfo.Top = 50;
+            _loopInfo.Height = 22;
+            _loopInfo.Text = "";
+
             _hint = new Label();
             _hint.AutoSize = false;
             _hint.Left = 8;
-            _hint.Top = 44;
+            _hint.Top = 80;
             _hint.Height = 36;
             _hint.Text = "正在看波形……";
 
             _detail = new Label();
             _detail.AutoSize = false;
             _detail.Left = 8;
-            _detail.Top = 82;
+            _detail.Top = 118;
             _detail.Height = 48;
             _detail.Text = "";
 
             _bar = new Panel();
-            _bar.Height = 140;
+            _bar.Height = 172;
             _bar.Controls.Add(_play);
             _bar.Controls.Add(_align);
             _bar.Controls.Add(_save);
             _bar.Controls.Add(_saveAs);
+            _bar.Controls.Add(_findLoop);
+            _bar.Controls.Add(_periodBox);
+            _bar.Controls.Add(_secLabel);
+            _bar.Controls.Add(_oneLoop);
+            _bar.Controls.Add(_gridOn);
+            _bar.Controls.Add(_loopInfo);
             _bar.Controls.Add(_hint);
             _bar.Controls.Add(_detail);
             _bar.Resize += delegate { LayoutBar(); };
@@ -109,6 +182,8 @@ namespace LoopTap
             Controls.Add(_bar);
             Resize += delegate { LayoutForm(); };
             OnResize(EventArgs.Empty);
+            UiTheme.Apply(this);
+            UiTheme.MarkAccent(_save);
 
             _playTimer = new System.Windows.Forms.Timer();
             _playTimer.Interval = 50;
@@ -158,6 +233,18 @@ namespace LoopTap
             _align.Enabled = false;
             _save.Enabled = false;
             _saveAs.Enabled = false;
+            _loopGen++;
+            _loopBusy = false;
+            _periodFrames = 0;
+            _phaseFrames = 0;
+            _suppress = true;
+            _periodBox.Text = "";
+            _gridOn.Checked = false;
+            _suppress = false;
+            _loopInfo.Text = "";
+            _findLoop.Enabled = true;
+            _oneLoop.Enabled = false;
+            _wave.SetLoop(0, 0, false);
             BeginScan(true);
         }
 
@@ -207,6 +294,15 @@ namespace LoopTap
             _align.Left = _play.Right + 8;
             if (_align.Right > _saveAs.Left - 8)
                 _align.Left = _saveAs.Left - _align.Width - 8;
+            _findLoop.Left = 8;
+            _periodBox.Left = _findLoop.Right + 8;
+            _secLabel.Left = _periodBox.Right + 4;
+            _oneLoop.Left = _secLabel.Right + 8;
+            _gridOn.Left = _oneLoop.Right + 8;
+            _loopInfo.Left = _gridOn.Right + 8;
+            int infoW = w - _loopInfo.Left - 8;
+            if (infoW < 40) infoW = 40;
+            _loopInfo.Width = infoW;
             _hint.Width = w - 16;
             _detail.Width = w - 16;
         }
@@ -287,6 +383,149 @@ namespace LoopTap
             }
             _wave.SetRange(_start, _end);
             UpdateText();
+        }
+
+        void BeginFind()
+        {
+            if (_info == null || _loopBusy || _saving) return;
+            int gen = ++_loopGen;
+            _loopBusy = true;
+            _findLoop.Enabled = false;
+            _loopInfo.Text = "正在找循环……";
+            WavInfo info = _info;
+            Thread t = new Thread(new ThreadStart(delegate
+            {
+                LoopHit hit = null;
+                Exception err = null;
+                try { hit = WavCut.FindLoop(info); }
+                catch (Exception ex) { err = ex; }
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (IsDisposed || gen != _loopGen) return;
+                        _loopBusy = false;
+                        if (_saving)
+                        {
+                            _findLoop.Enabled = false;
+                            return;
+                        }
+                        _findLoop.Enabled = true;
+                        if (err != null)
+                        {
+                            _loopInfo.Text = "找循环失败：" + err.Message;
+                            return;
+                        }
+                        if (hit == null || hit.Period <= 1)
+                        {
+                            _periodFrames = 0;
+                            _phaseFrames = 0;
+                            PushLoop();
+                            float conf = hit == null ? 0 : hit.Confidence;
+                            _loopInfo.Text = conf > 0.2f
+                                ? "重复不够清楚（置信度 " + conf.ToString("0%") + "）。可以自己填周期（秒）。"
+                                : "没听出重复的循环。可以自己填周期（秒）。";
+                            return;
+                        }
+                        _periodFrames = hit.Period;
+                        _phaseFrames = hit.Start;
+                        if (_phaseFrames < 0) _phaseFrames = 0;
+                        if (_info != null && _phaseFrames >= _info.Frames) _phaseFrames = 0;
+                        SetPeriodBox(hit.Period);
+                        _suppress = true;
+                        _gridOn.Checked = true;
+                        _suppress = false;
+                        PushLoop();
+                        double sec = hit.Period / (double)info.Rate;
+                        double reps = info.Frames / (double)hit.Period;
+                        _loopInfo.Text = string.Format(
+                            CultureInfo.InvariantCulture,
+                            "{0:0.00} 秒，置信度 {1:0%}，约 {2:0.0} 遍。金线平移，灰线改长短。",
+                            sec, hit.Confidence, reps);
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            }));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        void ApplyPeriodText()
+        {
+            if (_suppress || _info == null || _info.Rate <= 0) return;
+            string text = _periodBox.Text.Trim().Replace('，', '.').Replace(',', '.');
+            if (text.Length == 0) return;
+            double sec;
+            if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out sec) || sec <= 0)
+                return;
+            if (sec < 0.05) sec = 0.05;
+            long frames = (long)Math.Round(sec * _info.Rate);
+            if (frames < 1) frames = 1;
+            if (frames > _info.Frames) frames = _info.Frames;
+            if (frames == _periodFrames) return;
+            _periodFrames = frames;
+            if (_phaseFrames < 0 || _phaseFrames >= frames)
+                _phaseFrames = _scan != null ? _scan.AudibleStart : 0;
+            _suppress = true;
+            _gridOn.Checked = true;
+            _suppress = false;
+            PushLoop();
+            SetPeriodBox(frames);
+            _loopInfo.Text = "已按填写的周期画网格。金线平移，灰线改长短。";
+        }
+
+        void SelectOneLoop()
+        {
+            if (_info == null || _periodFrames <= 1) return;
+            if (_periodFrames >= _info.Frames)
+            {
+                _loopInfo.Text = "这个周期不短于整段。";
+                return;
+            }
+            long s = _phaseFrames % _periodFrames;
+            if (s < 0) s += _periodFrames;
+            if (s + _periodFrames > _info.Frames)
+                s = 0;
+            long e = s + _periodFrames;
+            if (e > _info.Frames) e = _info.Frames;
+            if (e <= s) return;
+            _justSaved = false;
+            _start = s;
+            _end = e;
+            _phaseFrames = s;
+            _wave.SetRange(_start, _end);
+            PushLoop();
+            UpdateText();
+            _loopInfo.Text = "选区已收到一个周期。金线是这一遍的起点。";
+        }
+
+        void OnLoopDragged()
+        {
+            _periodFrames = _wave.LoopPeriod;
+            _phaseFrames = _wave.LoopPhase;
+            SetPeriodBox(_periodFrames);
+            _oneLoop.Enabled = _periodFrames > 1 && !_saving;
+            _loopInfo.Text = PeriodText(_periodFrames) + " 秒。金线平移，灰线改长短。";
+        }
+
+        void PushLoop()
+        {
+            _wave.SetLoop(_periodFrames, _phaseFrames, _gridOn.Checked);
+            _oneLoop.Enabled = _periodFrames > 1 && !_saving && !_loopBusy;
+        }
+
+        void SetPeriodBox(long frames)
+        {
+            if (_info == null || _info.Rate <= 0) return;
+            _suppress = true;
+            _periodBox.Text = (frames / (double)_info.Rate).ToString("0.00", CultureInfo.InvariantCulture);
+            _suppress = false;
+        }
+
+        string PeriodText(long frames)
+        {
+            if (_info == null || _info.Rate <= 0) return "0.00";
+            return (frames / (double)_info.Rate).ToString("0.00", CultureInfo.InvariantCulture);
         }
 
         void UpdateText()
@@ -421,6 +660,8 @@ namespace LoopTap
             _save.Enabled = false;
             _saveAs.Enabled = false;
             _play.Enabled = false;
+            _findLoop.Enabled = false;
+            _oneLoop.Enabled = false;
             WavInfo info = _info;
             long a = _start;
             long b = _end;
@@ -473,6 +714,8 @@ namespace LoopTap
                             _play.Enabled = true;
                             _save.Enabled = true;
                             _saveAs.Enabled = true;
+                            _findLoop.Enabled = true;
+                            _oneLoop.Enabled = _periodFrames > 1;
                             MessageBox.Show(this, "保存失败：" + error + "\r\n原文件还在。", "LoopTap");
                             return;
                         }
@@ -483,6 +726,7 @@ namespace LoopTap
                             _play.Enabled = true;
                             _save.Enabled = true;
                             _saveAs.Enabled = true;
+                            _findLoop.Enabled = true;
                             MessageBox.Show(this, "已经保存，但重新打开失败：" + ex.Message, "LoopTap");
                         }
                     }));
@@ -519,17 +763,37 @@ namespace LoopTap
             long _bodyOrigin;
             long _bodyStart;
             long _bodyEnd;
+            long _period;
+            long _phase;
+            bool _grid;
+            long _gridK;
+            long _grabFrame;
+            long _grabPhase;
 
             public event EventHandler RangeChanged;
+            public event EventHandler LoopChanged;
 
             public long StartFrame { get { return _start; } }
             public long EndFrame { get { return _end; } }
             public long Playhead { get { return _play; } set { _play = value; } }
+            public long LoopPeriod { get { return _period; } }
+            public long LoopPhase { get { return _phase; } }
+
+            public void SetLoop(long period, long phase, bool show)
+            {
+                _period = period;
+                if (period > 1)
+                    _phase = Mod(phase, period);
+                else
+                    _phase = phase;
+                _grid = show && period > 1;
+                Invalidate();
+            }
 
             public WavePanel()
             {
                 SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-                BackColor = Color.FromArgb(28, 28, 28);
+                BackColor = UiTheme.Bg;
             }
 
             public void ShowScan(float[] min, float[] max, long frames, long start, long end)
@@ -559,7 +823,7 @@ namespace LoopTap
                 int xs = XAt(_start);
                 int xe = XAt(_end);
                 if (xe < xs) xe = xs;
-                using (Brush keep = new SolidBrush(Color.FromArgb(36, 48, 64)))
+                using (Brush keep = new SolidBrush(UiTheme.Keep))
                     g.FillRectangle(keep, xs, 0, Math.Max(1, xe - xs), h);
 
                 if (_min != null && _max != null && _min.Length > 0 && _frames > 0)
@@ -567,7 +831,7 @@ namespace LoopTap
                     int mid = h / 2;
                     float amp = (h / 2f) - 6f;
                     if (amp < 1f) amp = 1f;
-                    using (Pen wave = new Pen(Color.FromArgb(120, 190, 255)))
+                    using (Pen wave = new Pen(UiTheme.Wave))
                     {
                         int n = _min.Length;
                         for (int x = 0; x < w; x++)
@@ -588,12 +852,13 @@ namespace LoopTap
                     }
                 }
 
-                using (Brush dim = new SolidBrush(Color.FromArgb(150, 0, 0, 0)))
+                using (Brush dim = new SolidBrush(UiTheme.Dim))
                 {
                     if (xs > 0) g.FillRectangle(dim, 0, 0, xs, h);
                     if (xe < w) g.FillRectangle(dim, xe, 0, w - xe, h);
                 }
-                using (Pen handle = new Pen(Color.FromArgb(255, 196, 0), 2f))
+                DrawGrid(g, w, h);
+                using (Pen handle = new Pen(UiTheme.Gold, 2f))
                 {
                     int hs = xs;
                     int he = xe;
@@ -606,7 +871,7 @@ namespace LoopTap
                 {
                     int xp = XAt(_play);
                     if (xp > w - 1) xp = w - 1;
-                    using (Pen head = new Pen(Color.White, 1f))
+                    using (Pen head = new Pen(UiTheme.Text, 1f))
                         g.DrawLine(head, xp, 0, xp, h - 1);
                 }
             }
@@ -627,15 +892,31 @@ namespace LoopTap
                     _drag = 1;
                 else if (nearE)
                     _drag = 2;
-                else if (e.X > xs && e.X < xe)
-                {
-                    _drag = 3;
-                    _bodyOrigin = FrameAt(e.X);
-                    _bodyStart = _start;
-                    _bodyEnd = _end;
-                }
                 else
-                    _drag = e.X < xs ? 1 : 2;
+                {
+                    long gk;
+                    bool shift = (Control.ModifierKeys & Keys.Shift) == Keys.Shift;
+                    bool onGrid = HitGrid(e.X, out gk);
+                    if (_grid && (onGrid || shift))
+                    {
+                        _drag = (onGrid && gk != 0 && !shift) ? 5 : 4;
+                        _gridK = gk;
+                        _grabFrame = FrameAt(e.X);
+                        _grabPhase = _phase;
+                        Capture = true;
+                        DragGrid(e.X);
+                        return;
+                    }
+                    if (e.X > xs && e.X < xe)
+                    {
+                        _drag = 3;
+                        _bodyOrigin = FrameAt(e.X);
+                        _bodyStart = _start;
+                        _bodyEnd = _end;
+                    }
+                    else
+                        _drag = e.X < xs ? 1 : 2;
+                }
 
                 if (_drag == 1) MoveStart(FrameAt(e.X));
                 else if (_drag == 2) MoveEnd(FrameAt(e.X));
@@ -676,19 +957,39 @@ namespace LoopTap
                     FireRange();
                     return;
                 }
+                if (_drag == 4 || _drag == 5)
+                {
+                    DragGrid(e.X);
+                    return;
+                }
                 int xs = XAt(_start);
                 int xe = XAt(_end);
                 if (Math.Abs(e.X - xs) <= 10 || Math.Abs(e.X - xe) <= 10)
                     Cursor = Cursors.SizeWE;
-                else if (e.X > xs && e.X < xe)
-                    Cursor = Cursors.SizeAll;
                 else
-                    Cursor = Cursors.Default;
+                {
+                    long ignore;
+                    if (HitGrid(e.X, out ignore))
+                        Cursor = Cursors.SizeWE;
+                    else if (e.X > xs && e.X < xe)
+                        Cursor = Cursors.SizeAll;
+                    else
+                        Cursor = Cursors.Default;
+                }
             }
 
             protected override void OnMouseUp(MouseEventArgs e)
             {
                 base.OnMouseUp(e);
+                if (_drag == 4 || _drag == 5)
+                {
+                    if (_period > 1) _phase = Mod(_phase, _period);
+                    _drag = 0;
+                    Capture = false;
+                    Invalidate();
+                    FireLoop();
+                    return;
+                }
                 _drag = 0;
                 Capture = false;
             }
@@ -731,6 +1032,102 @@ namespace LoopTap
             {
                 EventHandler h = RangeChanged;
                 if (h != null) h(this, EventArgs.Empty);
+            }
+
+            void FireLoop()
+            {
+                EventHandler h = LoopChanged;
+                if (h != null) h(this, EventArgs.Empty);
+            }
+
+            void DrawGrid(Graphics g, int w, int h)
+            {
+                if (!_grid || _period <= 1 || _frames <= 0 || w <= 1) return;
+                int gap = XAt(_phase + _period) - XAt(_phase);
+                if (gap < 0) gap = -gap;
+                if (gap < 4) return;
+                using (Pen muted = new Pen(UiTheme.Muted))
+                using (Pen gold = new Pen(UiTheme.Gold))
+                {
+                    muted.DashStyle = DashStyle.Dash;
+                    gold.DashStyle = DashStyle.Dash;
+                    long k = 0;
+                    if (_phase > 0) k = -(_phase / _period);
+                    for (int n = 0; n < 400; n++, k++)
+                    {
+                        long fr = _phase + k * _period;
+                        if (fr < 0) continue;
+                        if (fr > _frames) break;
+                        int x = XAt(fr);
+                        if (x < 0 || x > w) continue;
+                        g.DrawLine(k == 0 ? gold : muted, x, 0, x, h - 1);
+                    }
+                }
+            }
+
+            bool HitGrid(int x, out long k)
+            {
+                k = 0;
+                if (!_grid || _period <= 1 || _frames <= 0) return false;
+                int gap = XAt(_phase + _period) - XAt(_phase);
+                if (gap < 0) gap = -gap;
+                if (gap < 4) return false;
+                int best = 7;
+                bool hit = false;
+                long kk = 0;
+                if (_phase > 0) kk = -(_phase / _period);
+                for (int n = 0; n < 400; n++, kk++)
+                {
+                    long fr = _phase + kk * _period;
+                    if (fr < 0) continue;
+                    if (fr > _frames) break;
+                    int d = x - XAt(fr);
+                    if (d < 0) d = -d;
+                    if (d < best)
+                    {
+                        best = d;
+                        k = kk;
+                        hit = true;
+                    }
+                }
+                return hit;
+            }
+
+            void DragGrid(int x)
+            {
+                if (_period <= 1) return;
+                long nf = FrameAt(x);
+                if (_drag == 4)
+                {
+                    long phase = _grabPhase + (nf - _grabFrame);
+                    if (phase < 0) phase = 0;
+                    if (phase >= _period) phase = _period - 1;
+                    _phase = phase;
+                }
+                else if (_drag == 5 && _gridK != 0)
+                {
+                    long k = _gridK;
+                    long numer = nf - _grabPhase;
+                    long np = k > 0 ? (numer + k / 2) / k : ((-numer) + (-k) / 2) / (-k);
+                    long minP = _frames / 400;
+                    if (minP < 1) minP = 1;
+                    if (np < minP) np = minP;
+                    if (_frames > 1 && np > _frames) np = _frames;
+                    _period = np;
+                    _phase = _grabPhase;
+                    if (_phase < 0) _phase = 0;
+                    if (_phase >= _period) _phase = _period - 1;
+                }
+                Invalidate();
+                FireLoop();
+            }
+
+            static long Mod(long value, long period)
+            {
+                if (period <= 0) return 0;
+                long r = value % period;
+                if (r < 0) r += period;
+                return r;
             }
         }
     }

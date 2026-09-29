@@ -17,6 +17,20 @@ namespace LoopTap
         public long Frames;
     }
 
+    sealed class LoopHit
+    {
+        public long Period;
+        public long Start;
+        public float Confidence;
+
+        public LoopHit(long period, long start, float confidence)
+        {
+            Period = period;
+            Start = start;
+            Confidence = confidence;
+        }
+    }
+
     sealed class WavScan
     {
         public float[] Min;
@@ -311,6 +325,311 @@ namespace LoopTap
             return new WavScan(min, max, audibleStart, audibleEnd);
         }
 
+        // ponytail: 10ms 峰值包络（最多 8192 档）上做 FFT 自相关，再在粗周期 ± 几档里用更细的 hop 核对。
+        // 细档大约是周期的 1/6000。内容若自己又是整段循环，会认成更短的那档。短于 0.2 秒不搜。
+        // 升级：用户框一段再搜。
+        public static LoopHit FindLoop(WavInfo info)
+        {
+            long firstHot = 0;
+            if (info == null || info.Frames < 32 || info.Rate < 1 || info.BlockAlign < 4)
+                return new LoopHit(0, 0, 0);
+            long hop = info.Rate / 100;
+            if (hop < 1) hop = 1;
+            long binsL = (info.Frames + hop - 1) / hop;
+            if (binsL > 8192)
+            {
+                hop = (info.Frames + 8191) / 8192;
+                if (hop < 1) hop = 1;
+                binsL = (info.Frames + hop - 1) / hop;
+            }
+            if (binsL > 8192) binsL = 8192;
+            if (binsL < 16) return new LoopHit(0, 0, 0);
+            int bins = (int)binsL;
+            float[] env = new float[bins];
+            firstHot = FillEnvelope(info, 0, info.Frames, env, hop);
+            if (firstHot < 0) firstHot = 0;
+
+            int nfft = 1;
+            while (nfft < bins * 2) nfft <<= 1;
+            double[] re = new double[nfft];
+            double[] im = new double[nfft];
+            double mean = 0;
+            for (int i = 0; i < bins; i++) mean += env[i];
+            mean /= bins;
+            double energy = 0;
+            for (int i = 0; i < bins; i++)
+            {
+                double v = env[i] - mean;
+                re[i] = v;
+                energy += v * v;
+            }
+            if (energy < 1e-8)
+                return new LoopHit(0, firstHot, 0);
+
+            Fft(re, im, false);
+            for (int i = 0; i < nfft; i++)
+            {
+                re[i] = re[i] * re[i] + im[i] * im[i];
+                im[i] = 0;
+            }
+            Fft(re, im, true);
+            double r0 = re[0];
+            if (r0 <= 1e-12)
+                return new LoopHit(0, firstHot, 0);
+
+            long minFrames = info.Rate / 5;
+            if (minFrames < 1) minFrames = 1;
+            int minLag = (int)((minFrames + hop - 1) / hop);
+            if (minLag < 4) minLag = 4;
+            int maxLag = bins / 2;
+            if (minLag >= maxLag)
+                return new LoopHit(0, firstHot, 0);
+
+            float[] corr = new float[maxLag + 1];
+            for (int lag = 1; lag <= maxLag; lag++)
+            {
+                double c = re[lag] / r0;
+                if (c < 0) c = 0;
+                if (c > 1.25) c = 1.25;
+                corr[lag] = (float)c;
+            }
+
+            float peak = 0;
+            int peakLag = 0;
+            for (int lag = minLag; lag <= maxLag; lag++)
+            {
+                if (corr[lag] + 1e-4f < corr[lag - 1]) continue;
+                if (lag < maxLag && corr[lag] + 1e-4f < corr[lag + 1]) continue;
+                if (corr[lag] > peak)
+                {
+                    peak = corr[lag];
+                    peakLag = lag;
+                }
+            }
+            if (peakLag == 0 || peak < 0.40f)
+                return new LoopHit(0, firstHot, peak);
+
+            int chosen = peakLag;
+            for (int k = 2; k <= 12; k++)
+            {
+                int guess = (int)Math.Round(peakLag / (double)k);
+                if (guess < minLag) break;
+                int radius = guess / 40;
+                if (radius < 2) radius = 2;
+                int lo = guess - radius;
+                int hi = guess + radius;
+                if (lo < minLag) lo = minLag;
+                if (hi > maxLag) hi = maxLag;
+                int at = lo;
+                for (int lag = lo; lag <= hi; lag++)
+                {
+                    if (corr[lag] > corr[at]) at = lag;
+                }
+                if (at < chosen && corr[at] >= peak * 0.82f)
+                    chosen = at;
+            }
+
+            double delta = 0;
+            if (chosen > 0 && chosen < maxLag)
+            {
+                double y0 = corr[chosen - 1];
+                double y1 = corr[chosen];
+                double y2 = corr[chosen + 1];
+                double den = y0 - 2.0 * y1 + y2;
+                if (den > 1e-6 || den < -1e-6)
+                    delta = 0.5 * (y0 - y2) / den;
+                if (delta > 0.5) delta = 0.5;
+                if (delta < -0.5) delta = -0.5;
+            }
+            long coarse = (long)Math.Round((chosen + delta) * (double)hop);
+            if (coarse < 1) coarse = 1;
+            float pearson;
+            long period = RefinePeriod(info, coarse, bins, out pearson);
+            if (period < 1) period = coarse;
+            if (pearson < 0)
+            {
+                if (peak < 0.55f) return new LoopHit(0, firstHot, peak);
+                return new LoopHit(period, firstHot, peak > 1f ? 1f : peak);
+            }
+            if (pearson < 0.72f)
+                return new LoopHit(0, firstHot, pearson);
+            return new LoopHit(period, firstHot, pearson > 1f ? 1f : pearson);
+        }
+
+        static long RefinePeriod(WavInfo info, long coarse, int coarseBins, out float confidence)
+        {
+            confidence = -1;
+            if (coarse < 2 || info.Frames < coarse * 2) return coarse;
+            long slop = (info.Frames * 4) / coarseBins + 1;
+            long cap = coarse / 15;
+            if (cap < 4) cap = 4;
+            if (slop > cap) slop = cap;
+            long hop = coarse / 6000;
+            if (hop < 1) hop = 1;
+            long span = coarse * 3 + slop;
+            if (span > info.Frames) span = info.Frames;
+            if (span / hop > 20000)
+            {
+                hop = span / 20000;
+                if (hop < 1) hop = 1;
+            }
+            int bins = (int)(span / hop);
+            if (bins < 64) return coarse;
+            float[] env = new float[bins];
+            long framesRead = (long)bins * hop;
+            if (framesRead > info.Frames) framesRead = info.Frames;
+            FillEnvelope(info, 0, framesRead, env, hop);
+
+            int lagLo = (int)((coarse - slop) / hop);
+            int lagHi = (int)((coarse + slop + hop - 1) / hop);
+            if (lagLo < 1) lagLo = 1;
+            if (lagHi > bins / 2) lagHi = bins / 2;
+            if (lagHi - lagLo > 400) lagHi = lagLo + 400;
+            if (lagHi <= lagLo) return coarse;
+
+            int bestLag = lagLo;
+            double best = -2;
+            for (int lag = lagLo; lag <= lagHi; lag++)
+            {
+                double c = Pearson(env, lag);
+                if (c > best)
+                {
+                    best = c;
+                    bestLag = lag;
+                }
+            }
+            confidence = (float)best;
+            if (best < 0.45) return coarse;
+            long refined = (long)bestLag * hop;
+            if (refined < 1) return coarse;
+            return refined;
+        }
+
+        static double Pearson(float[] x, int lag)
+        {
+            int n = x.Length - lag;
+            if (n < 8) return 0;
+            double sa = 0, sb = 0;
+            for (int i = 0; i < n; i++)
+            {
+                sa += x[i];
+                sb += x[i + lag];
+            }
+            double ma = sa / n;
+            double mb = sb / n;
+            double num = 0, da = 0, db = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double a = x[i] - ma;
+                double b = x[i + lag] - mb;
+                num += a * b;
+                da += a * a;
+                db += b * b;
+            }
+            if (da < 1e-12 || db < 1e-12) return 0;
+            return num / Math.Sqrt(da * db);
+        }
+
+        static void Fft(double[] re, double[] im, bool inverse)
+        {
+            int n = re.Length;
+            for (int i = 1, j = 0; i < n; i++)
+            {
+                int bit = n >> 1;
+                for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+                j ^= bit;
+                if (i < j)
+                {
+                    double tr = re[i]; re[i] = re[j]; re[j] = tr;
+                    double ti = im[i]; im[i] = im[j]; im[j] = ti;
+                }
+            }
+            for (int len = 2; len <= n; len <<= 1)
+            {
+                double ang = (2.0 * Math.PI / len) * (inverse ? 1 : -1);
+                double wlenRe = Math.Cos(ang);
+                double wlenIm = Math.Sin(ang);
+                for (int i = 0; i < n; i += len)
+                {
+                    double wRe = 1, wIm = 0;
+                    int half = len >> 1;
+                    for (int j = 0; j < half; j++)
+                    {
+                        int u = i + j;
+                        int v = u + half;
+                        double vr = re[v] * wRe - im[v] * wIm;
+                        double vi = re[v] * wIm + im[v] * wRe;
+                        re[v] = re[u] - vr;
+                        im[v] = im[u] - vi;
+                        re[u] += vr;
+                        im[u] += vi;
+                        double nextRe = wRe * wlenRe - wIm * wlenIm;
+                        wIm = wRe * wlenIm + wIm * wlenRe;
+                        wRe = nextRe;
+                    }
+                }
+            }
+            if (!inverse) return;
+            double inv = 1.0 / n;
+            for (int i = 0; i < n; i++)
+            {
+                re[i] *= inv;
+                im[i] *= inv;
+            }
+        }
+
+        static long FillEnvelope(WavInfo info, long startFrame, long frameCount, float[] env, long hop)
+        {
+            long firstHot = -1;
+            if (frameCount <= 0 || info.BlockAlign <= 0 || env == null || env.Length == 0) return firstHot;
+            if (hop < 1) hop = 1;
+            int bins = env.Length;
+            int block = info.BlockAlign;
+            byte[] buf = new byte[65536 - (65536 % block)];
+            using (FileStream fs = new FileStream(info.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                fs.Position = info.DataOffset + startFrame * block;
+                long left = frameCount * block;
+                long remain = fs.Length - fs.Position;
+                if (left > remain) left = remain;
+                long frame = startFrame;
+                while (left >= block)
+                {
+                    int want = buf.Length;
+                    if (want > left) want = (int)left;
+                    int got = 0;
+                    while (got < want)
+                    {
+                        int n = fs.Read(buf, got, want - got);
+                        if (n <= 0) break;
+                        got += n;
+                    }
+                    got -= got % block;
+                    if (got <= 0) break;
+                    int framesHere = got / block;
+                    for (int i = 0; i < framesHere; i++)
+                    {
+                        int off = i * block;
+                        float loud = 0;
+                        for (int c = 0; c < info.Channels; c++)
+                        {
+                            float s = BitConverter.ToSingle(buf, off + c * 4);
+                            if (float.IsNaN(s)) s = 0;
+                            float a = s < 0 ? -s : s;
+                            if (a > loud) loud = a;
+                        }
+                        int col = (int)((frame - startFrame) / hop);
+                        if (col >= bins) col = bins - 1;
+                        if (col >= 0 && loud > env[col]) env[col] = loud;
+                        if (firstHot < 0 && loud >= 1e-4f) firstHot = frame;
+                        frame++;
+                    }
+                    left -= got;
+                }
+            }
+            return firstHot;
+        }
+
         public static string ChooseBackup(string wavPath, Predicate<string> taken)
         {
             string first = wavPath + ".bak.wav";
@@ -486,6 +805,30 @@ namespace LoopTap
 
                 string bak = ChooseBackup(path, delegate(string candidate) { return candidate.EndsWith(".bak.wav", StringComparison.Ordinal); });
                 Check(bak.EndsWith(".bak2.wav", StringComparison.Ordinal), "备份文件名没有避开已有文件");
+
+                string loop3 = path + ".loop3";
+                WriteToneLoops(loop3, rate, 0, 12000, 12000, 3, 0);
+                LoopHit h3 = FindLoop(Open(loop3));
+                Check(Math.Abs(h3.Period - 24000) <= 8, "三段循环周期不对：" + h3.Period + " conf=" + h3.Confidence);
+                Check(h3.Start >= 0 && h3.Start <= 8, "三段循环起点不对：" + h3.Start);
+                Check(h3.Confidence >= 0.7f, "三段循环置信度太低：" + h3.Confidence);
+
+                string loopLead = path + ".loopLead";
+                WriteToneLoops(loopLead, rate, 4800, 12000, 12000, 3, 0);
+                LoopHit leadHit = FindLoop(Open(loopLead));
+                Check(Math.Abs(leadHit.Period - 24000) <= 8, "带空白的周期不对：" + leadHit.Period + " conf=" + leadHit.Confidence);
+                Check(Math.Abs(leadHit.Start - 4800) <= 8, "带空白的起点不对：" + leadHit.Start);
+
+                string loopOnce = path + ".loopOnce";
+                WriteToneLoops(loopOnce, rate, 0, 12000, 48000, 1, 0);
+                LoopHit onceHit = FindLoop(Open(loopOnce));
+                Check(onceHit.Period == 0, "没有重复却找出了周期：" + onceHit.Period + " conf=" + onceHit.Confidence);
+
+                string loop14 = path + ".loop14";
+                WriteToneLoops(loop14, rate, 0, 6000, 6000, 14, 3000);
+                LoopHit many = FindLoop(Open(loop14));
+                Check(Math.Abs(many.Period - 12000) <= 8, "十四遍周期不对：" + many.Period + " conf=" + many.Confidence);
+                Check(many.Start >= 0 && many.Start <= 8, "十四遍起点不对：" + many.Start);
             }
             finally
             {
@@ -496,6 +839,36 @@ namespace LoopTap
                 try { File.Delete(path + ".keep.wav.part"); } catch { }
                 try { File.Delete(path + ".soft"); } catch { }
                 try { File.Delete(path + ".floor"); } catch { }
+                try { File.Delete(path + ".loop3"); } catch { }
+                try { File.Delete(path + ".loopLead"); } catch { }
+                try { File.Delete(path + ".loopOnce"); } catch { }
+                try { File.Delete(path + ".loop14"); } catch { }
+            }
+        }
+
+        static void WriteToneLoops(string path, int rate, int lead, int burst, int gap, int reps, int tail)
+        {
+            int channels = 2;
+            int block = 8;
+            int unit = burst + gap;
+            int frames = lead + reps * unit + tail;
+            byte[] pcm = new byte[frames * block];
+            for (int r = 0; r < reps; r++)
+            {
+                int origin = lead + r * unit;
+                for (int j = 0; j < burst; j++)
+                {
+                    float s = (float)(0.5 * Math.Sin((2.0 * Math.PI * 440.0 * j) / rate));
+                    byte[] sample = BitConverter.GetBytes(s);
+                    int idx = (origin + j) * block;
+                    Buffer.BlockCopy(sample, 0, pcm, idx, 4);
+                    Buffer.BlockCopy(sample, 0, pcm, idx + 4, 4);
+                }
+            }
+            using (WavWriter w = new WavWriter(path, channels, rate, 32, block, 3))
+            {
+                w.Write(pcm, pcm.Length);
+                w.Finish();
             }
         }
 

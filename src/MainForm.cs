@@ -53,6 +53,7 @@ namespace LoopTap
             Height = 680;
             MinimumSize = new Size(780, 540);
             AutoScaleMode = AutoScaleMode.Dpi;
+            DoubleBuffered = true;
             try { Font = new Font("Microsoft YaHei UI", 9f); }
             catch { }
 
@@ -92,7 +93,6 @@ namespace LoopTap
             _list = new ListView();
             _list.View = View.Details;
             _list.FullRowSelect = true;
-            _list.GridLines = true;
             _list.HideSelection = false;
             _list.MultiSelect = false;
             _list.Columns.Add("备注", 100);
@@ -253,6 +253,12 @@ namespace LoopTap
                 bottom.BringToFront();
             };
             OnResize(EventArgs.Empty);
+            UiTheme.Apply(this);
+            dirLabel.ForeColor = UiTheme.Muted;
+            _duration.ForeColor = UiTheme.Wave;
+            try { _duration.Font = new Font(Font, FontStyle.Bold); }
+            catch { }
+            UiTheme.MarkAccent(_start);
             ScreenPlace.CenterOnCursor(this);
 
             _timer = new Timer();
@@ -368,6 +374,9 @@ namespace LoopTap
                     row.Title = title;
                     row.WindowCount = p.WindowCount;
                     item.Tag = row;
+                    item.BackColor = UiTheme.Field;
+                    item.ForeColor = UiTheme.Text;
+                    item.UseItemStyleForSubItems = true;
                     if (keep != null && keep.Pid == p.Pid)
                     {
                         bool ticksOk = keep.StartTicks == 0 || p.StartTicks == 0 || keep.StartTicks == p.StartTicks;
@@ -378,7 +387,10 @@ namespace LoopTap
                             pidReused = true;
                     }
                     if (p.Playing)
-                        item.BackColor = Color.FromArgb(255, 244, 180);
+                    {
+                        item.BackColor = UiTheme.Playing;
+                        item.ForeColor = UiTheme.PlayingText;
+                    }
                     _list.Items.Add(item);
                     if (p.Playing)
                     {

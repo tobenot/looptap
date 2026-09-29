@@ -287,6 +287,9 @@ namespace LoopTap
                 return 0;
             }
 
+            if (args != null && args.Length == 2 && args[0] == "--loop")
+                return LoopCmd(args[1]);
+
             if (args != null && args.Length == 2 && args[0] == "--trim")
             {
                 if (!File.Exists(args[1]))
@@ -294,6 +297,7 @@ namespace LoopTap
                     MessageBox.Show("找不到录音：" + args[1], "LoopTap");
                     return 1;
                 }
+                UiTheme.Enable();
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new TrimForm(args[1]));
@@ -309,6 +313,7 @@ namespace LoopTap
                     SignalExisting();
                     return 0;
                 }
+                UiTheme.Enable();
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -345,8 +350,29 @@ namespace LoopTap
             Console.WriteLine("  LoopTap.exe --list                  列出进程");
             Console.WriteLine("  LoopTap.exe --selfcheck             检查出声归因和裁剪");
             Console.WriteLine("  LoopTap.exe --trim <wav路径>        打开裁剪窗口");
+            Console.WriteLine("  LoopTap.exe --loop <wav路径>        打印循环周期");
             Console.WriteLine("  LoopTap.exe --record <pid> <秒> <wav路径>");
             return 1;
+        }
+
+        static int LoopCmd(string path)
+        {
+            if (!File.Exists(path))
+            {
+                Console.Error.WriteLine("找不到录音：" + path);
+                return 1;
+            }
+            WavInfo info = WavCut.Open(path);
+            LoopHit hit = WavCut.FindLoop(info);
+            Console.WriteLine("frames=" + info.Frames + " rate=" + info.Rate);
+            Console.WriteLine("period=" + hit.Period + " start=" + hit.Start + " conf=" + hit.Confidence.ToString("0.000"));
+            if (info.Rate > 0 && hit.Period > 0)
+            {
+                double sec = hit.Period / (double)info.Rate;
+                double reps = info.Frames / (double)hit.Period;
+                Console.WriteLine("sec=" + sec.ToString("0.00") + " reps=" + reps.ToString("0.00"));
+            }
+            return hit.Period > 0 ? 0 : 1;
         }
 
         static int ListCmd()
