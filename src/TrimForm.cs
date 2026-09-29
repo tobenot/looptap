@@ -160,11 +160,11 @@ namespace LoopTap
             _detail.AutoSize = false;
             _detail.Left = 8;
             _detail.Top = 118;
-            _detail.Height = 48;
+            _detail.Height = 64;
             _detail.Text = "";
 
             _bar = new Panel();
-            _bar.Height = 172;
+            _bar.Height = 196;
             _bar.Controls.Add(_play);
             _bar.Controls.Add(_align);
             _bar.Controls.Add(_save);
@@ -549,9 +549,15 @@ namespace LoopTap
             double tailSec = (_info.Frames - _end) / (double)_info.Rate;
             double keep = (_end - _start) / (double)_info.Rate;
             string prefix = _justSaved ? (_savedExtra ?? "已保存。") : "";
+            string size = "";
+            try
+            {
+                size = " 文件 " + RecordingName.FormatSize(new FileInfo(_info.Path).Length) + "。";
+            }
+            catch { }
             _detail.Text = prefix + string.Format(
                 "开头去掉 {0}，结尾去掉 {1}，留下 {2}（{3} 个采样点，原样拷贝）。",
-                Clock(lead), Clock(tailSec), Clock(keep), _end - _start);
+                Clock(lead), Clock(tailSec), Clock(keep), _end - _start) + size;
         }
 
         void TogglePlay()

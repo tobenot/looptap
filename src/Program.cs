@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -98,6 +99,273 @@ namespace LoopTap
             string disk = FailureText(true, "磁盘已满，录音停在最后一个完整位置。");
             if (disk.IndexOf("磁盘已满", StringComparison.Ordinal) < 0)
                 throw new InvalidOperationException("磁盘满的说明被盖掉了。");
+        }
+    }
+
+    static class RecordingName
+    {
+        // ponytail: 只剥这张短表里的平台尾巴。不认识的网站名会留在文件名里。升级：让用户改这一段名字。
+        static readonly string[] Platforms = new string[]
+        {
+            "网易云音乐", "YouTube Music", "Google Chrome", "Mozilla Firefox", "Microsoft Edge",
+            "Apple Music", "QQ音乐", "酷狗音乐", "酷我音乐", "汽水音乐", "喜马拉雅", "哔哩哔哩",
+            "bilibili", "网易云", "YouTube", "Spotify", "Chrome", "Firefox", "Edge", "Opera",
+            "Brave", "Vivaldi", "Safari"
+        };
+
+        public static string MusicTitle(string title, string processName)
+        {
+            string proc = Token(processName);
+            if (proc.Length == 0) proc = "proc";
+            if (string.IsNullOrEmpty(title)) return proc;
+            string raw = title.Trim();
+            if (raw.IndexOf("没有窗口", StringComparison.Ordinal) >= 0) return proc;
+            string music = Token(StripPlatform(raw));
+            if (music.Length == 0) return proc;
+            return music;
+        }
+
+        public static string Build(DateTime when, string title, string processName)
+        {
+            string music = MusicTitle(title, processName);
+            string proc = Token(processName);
+            if (proc.Length == 0) proc = "proc";
+            string stamp = when.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+            if (string.Equals(music, proc, StringComparison.OrdinalIgnoreCase))
+                return stamp + "_" + proc + ".wav";
+            return stamp + "_" + music + "_" + proc + ".wav";
+        }
+
+        public static string WithDuration(string path, double seconds)
+        {
+            string dir = Path.GetDirectoryName(path) ?? "";
+            string name = Path.GetFileNameWithoutExtension(path ?? "");
+            string ext = Path.GetExtension(path ?? "");
+            if (ext.Length == 0) ext = ".wav";
+            name = StripDurationSuffix(name);
+            return Path.Combine(dir, name + "_" + FormatDuration(seconds) + ext);
+        }
+
+        public static string AvoidClash(string path, string keep)
+        {
+            if (SamePath(path, keep) || !File.Exists(path)) return path;
+            string dir = Path.GetDirectoryName(path) ?? "";
+            string name = Path.GetFileNameWithoutExtension(path);
+            string ext = Path.GetExtension(path);
+            for (int i = 2; i < 1000; i++)
+            {
+                string candidate = Path.Combine(dir, name + "_" + i.ToString(CultureInfo.InvariantCulture) + ext);
+                if (SamePath(candidate, keep) || !File.Exists(candidate)) return candidate;
+            }
+            return Path.Combine(dir, name + "_" + DateTime.Now.ToString("HHmmss", CultureInfo.InvariantCulture) + ext);
+        }
+
+        public static string FormatDuration(double seconds)
+        {
+            if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0) seconds = 0;
+            int total = (int)Math.Round(seconds);
+            if (total < 0) total = 0;
+            if (seconds > 0 && total == 0) total = 1;
+            int h = total / 3600;
+            int m = (total % 3600) / 60;
+            int s = total % 60;
+            if (h > 0)
+                return h.ToString(CultureInfo.InvariantCulture) + "h" + m.ToString("00", CultureInfo.InvariantCulture) + "m" + s.ToString("00", CultureInfo.InvariantCulture) + "s";
+            return m.ToString("00", CultureInfo.InvariantCulture) + "m" + s.ToString("00", CultureInfo.InvariantCulture) + "s";
+        }
+
+        public static string FormatSize(long bytes)
+        {
+            if (bytes < 0) bytes = 0;
+            if (bytes < 1024) return bytes.ToString(CultureInfo.InvariantCulture) + " B";
+            double v = bytes;
+            if (v < 1024 * 1024)
+                return (v / 1024).ToString("0.0", CultureInfo.InvariantCulture) + " KB";
+            if (v < 1024.0 * 1024 * 1024)
+                return (v / (1024 * 1024)).ToString("0.0", CultureInfo.InvariantCulture) + " MB";
+            return (v / (1024.0 * 1024 * 1024)).ToString("0.00", CultureInfo.InvariantCulture) + " GB";
+        }
+
+        public static void SelfCheck()
+        {
+            string cloud = MusicTitle("Prushka Sequence - Kevin Penkin", "cloudmusic");
+            if (cloud != "Prushka Sequence - Kevin Penkin")
+                throw new InvalidOperationException("歌名和歌手被拆掉了：" + cloud);
+            string kept = MusicTitle("Prushka Sequence - Kevin Penkin - 网易云音乐", "cloudmusic");
+            if (kept != "Prushka Sequence - Kevin Penkin")
+                throw new InvalidOperationException("平台后缀没有剥掉，或歌手被一起剥了：" + kept);
+            string chrome = MusicTitle("晴天 - 周杰伦 - 网易云音乐 - Google Chrome", "chrome");
+            if (chrome != "晴天 - 周杰伦")
+                throw new InvalidOperationException("浏览器标题没有收成歌名：" + chrome);
+            string spotify = MusicTitle("Song Name | Spotify", "spotify");
+            if (spotify != "Song Name")
+                throw new InvalidOperationException("竖线平台后缀还在：" + spotify);
+            string yt = MusicTitle("Artist - Topic - YouTube", "chrome");
+            if (yt != "Artist - Topic")
+                throw new InvalidOperationException("YouTube 后缀还在：" + yt);
+            string bad = MusicTitle("a<b>c:d\"e/f\\g|h?i*", "chrome");
+            if (bad != "a_b_c_d_e_f_g_h_i")
+                throw new InvalidOperationException("非法字符没有换成下划线：" + bad);
+            string spaces = MusicTitle("  a   b  ", "chrome");
+            if (spaces != "a b")
+                throw new InvalidOperationException("连续空格没有收拢：" + spaces);
+            string empty = MusicTitle("", "chrome");
+            if (empty != "chrome")
+                throw new InvalidOperationException("空标题没有退回进程名：" + empty);
+            string blank = MusicTitle("   - Google Chrome", "chrome");
+            if (blank != "chrome")
+                throw new InvalidOperationException("只剩浏览器名时没有退回进程名：" + blank);
+            string none = MusicTitle("(没有窗口，声音在这个进程里)", "notepad");
+            if (none != "notepad")
+                throw new InvalidOperationException("没窗口的占位文字进了文件名：" + none);
+            string longTitle = new string('啊', 70) + " - 网易云音乐";
+            string cut = MusicTitle(longTitle, "chrome");
+            if (cut.Length != 60 || cut != new string('啊', 60))
+                throw new InvalidOperationException("超长标题没有按字符截到 60：" + cut.Length);
+            if (FormatDuration(185.4) != "03m05s")
+                throw new InvalidOperationException("时长格式不对：" + FormatDuration(185.4));
+            if (FormatDuration(3725) != "1h02m05s")
+                throw new InvalidOperationException("超过一小时的时长不对：" + FormatDuration(3725));
+            if (FormatDuration(0) != "00m00s" || FormatDuration(0.2) != "00m01s")
+                throw new InvalidOperationException("不足一秒的时长不对。");
+            if (FormatSize(500) != "500 B" || FormatSize(1536) != "1.5 KB" || FormatSize(2 * 1024 * 1024) != "2.0 MB")
+                throw new InvalidOperationException("文件大小格式不对。");
+            DateTime when = new DateTime(2026, 9, 29, 22, 25, 30);
+            string named = Build(when, "Prushka Sequence - Kevin Penkin", "cloudmusic");
+            if (named != "20260929_222530_Prushka Sequence - Kevin Penkin_cloudmusic.wav")
+                throw new InvalidOperationException("网易云文件名不对：" + named);
+            string bare = Build(when, "", "notepad");
+            if (bare != "20260929_222530_notepad.wav")
+                throw new InvalidOperationException("无标题文件名不对：" + bare);
+            if (!named.StartsWith("20260929_222530_", StringComparison.Ordinal))
+                throw new InvalidOperationException("日期没有留在最前面。");
+            string path = WithDuration(@"C:\rec\" + named, 65);
+            string expect = Path.Combine(@"C:\rec", "20260929_222530_Prushka Sequence - Kevin Penkin_cloudmusic_01m05s.wav");
+            if (path != expect)
+                throw new InvalidOperationException("时长没有接在文件名末尾：" + path);
+            if (WithDuration(path, 65) != path)
+                throw new InvalidOperationException("时长被写了两遍。");
+        }
+
+        static string Token(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            string s = raw.Trim();
+            if (s.Length == 0) return "";
+            char[] bad = Path.GetInvalidFileNameChars();
+            StringBuilder sb = new StringBuilder(s.Length);
+            bool pendingSpace = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\u3000')
+                {
+                    if (sb.Length > 0) pendingSpace = true;
+                    continue;
+                }
+                bool invalid = false;
+                for (int j = 0; j < bad.Length; j++)
+                {
+                    if (bad[j] == c) { invalid = true; break; }
+                }
+                if (pendingSpace)
+                {
+                    sb.Append(' ');
+                    pendingSpace = false;
+                }
+                sb.Append(invalid ? '_' : c);
+            }
+            string t = sb.ToString();
+            while (t.IndexOf("__", StringComparison.Ordinal) >= 0)
+                t = t.Replace("__", "_");
+            t = t.Trim(' ', '_', '.');
+            if (t.Length > 60)
+                t = t.Substring(0, 60).Trim(' ', '_', '.');
+            return t;
+        }
+
+        static string StripPlatform(string title)
+        {
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                title = title.Trim();
+                for (int i = 0; i < Platforms.Length; i++)
+                {
+                    string platform = Platforms[i];
+                    if (!EndsWithPlatform(title, platform)) continue;
+                    title = title.Substring(0, title.Length - platform.Length);
+                    title = title.TrimEnd();
+                    title = TrimSeparator(title);
+                    changed = true;
+                    break;
+                }
+            }
+            return title.Trim();
+        }
+
+        static bool EndsWithPlatform(string title, string platform)
+        {
+            if (string.IsNullOrEmpty(title) || title.Length < platform.Length) return false;
+            if (string.Compare(title, title.Length - platform.Length, platform, 0, platform.Length, StringComparison.OrdinalIgnoreCase) != 0)
+                return false;
+            if (title.Length == platform.Length) return true;
+            string left = title.Substring(0, title.Length - platform.Length).TrimEnd();
+            if (left.Length == 0) return true;
+            char c = left[left.Length - 1];
+            return c == '-' || c == '|' || c == '\u2013' || c == '\u2014' || c == '\uFF0D';
+        }
+
+        static string TrimSeparator(string title)
+        {
+            title = title.TrimEnd();
+            while (title.Length > 0)
+            {
+                char c = title[title.Length - 1];
+                if (c == '-' || c == '|' || c == '\u2013' || c == '\u2014' || c == '\uFF0D' || c == ' ')
+                    title = title.Substring(0, title.Length - 1).TrimEnd();
+                else
+                    break;
+            }
+            return title;
+        }
+
+        static string StripDurationSuffix(string name)
+        {
+            int us = name.LastIndexOf('_');
+            if (us <= 0 || us >= name.Length - 1) return name;
+            if (!IsDurationToken(name.Substring(us + 1))) return name;
+            return name.Substring(0, us);
+        }
+
+        static bool IsDurationToken(string token)
+        {
+            int i = 0;
+            int h = token.IndexOf('h');
+            if (h >= 0)
+            {
+                if (h < 1) return false;
+                for (int k = 0; k < h; k++)
+                {
+                    if (token[k] < '0' || token[k] > '9') return false;
+                }
+                i = h + 1;
+            }
+            if (token.Length != i + 6) return false;
+            return Digit(token[i]) && Digit(token[i + 1]) && token[i + 2] == 'm'
+                && Digit(token[i + 3]) && Digit(token[i + 4]) && token[i + 5] == 's';
+        }
+
+        static bool Digit(char c)
+        {
+            return c >= '0' && c <= '9';
+        }
+
+        static bool SamePath(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -281,6 +549,7 @@ namespace LoopTap
                 WhoPlays.SelfCheck();
                 ProcCatalog.SelfCheck();
                 ProcessIdentity.SelfCheck();
+                RecordingName.SelfCheck();
                 WavWriter.SelfCheck();
                 WavCut.SelfCheck();
                 Console.WriteLine("selfcheck ok");

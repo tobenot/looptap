@@ -493,8 +493,8 @@ namespace LoopTap
                 return;
             }
 
-            string file = string.Format("{0:yyyyMMdd_HHmmss}_{1}_{2}.wav", DateTime.Now, Safe(name), pid);
-            string path = Path.Combine(dir, file);
+            string file = RecordingName.Build(DateTime.Now, row.Title, name);
+            string path = RecordingName.AvoidClash(Path.Combine(dir, file), null);
             _lastFile = path;
             if (_rec != null)
             {
@@ -549,19 +549,12 @@ namespace LoopTap
                 }
                 else if (_rec.Cancelled)
                 {
-                    FinishIdle(_rec.Summary ?? "已取消。");
-                    OfferTrim();
+                    FinishRecorded(_rec.Summary ?? "已取消。", null);
                 }
                 else
                 {
                     string err = _rec.Error ?? "启动录制失败。";
-                    FinishIdle(err);
-                    if (!_shownError)
-                    {
-                        _shownError = true;
-                        MessageBox.Show(this, err, "LoopTap");
-                    }
-                    OfferTrim();
+                    FinishRecorded(err, err);
                 }
             }
 
@@ -584,15 +577,63 @@ namespace LoopTap
                         done = _rec.Failed ? (_rec.Error ?? "录制失败。") : "已停止。";
                     if (_rec.Failed && !string.IsNullOrEmpty(_rec.Error))
                         done = _rec.Error;
-                    FinishIdle(done);
-                    if (_rec.Failed && !_shownError)
-                    {
-                        _shownError = true;
-                        MessageBox.Show(this, _rec.Error ?? done, "LoopTap");
-                    }
-                    OfferTrim();
+                    FinishRecorded(done, _rec.Failed ? (_rec.Error ?? done) : null);
                 }
             }
+        }
+
+        void FinishRecorded(string status, string errorPopup)
+        {
+            string oldPath = _rec != null ? _rec.OutputPath : null;
+            string finalPath = AttachDuration();
+            if (!string.IsNullOrEmpty(status) && !string.IsNullOrEmpty(oldPath) && !string.IsNullOrEmpty(finalPath))
+                status = status.Replace(oldPath, finalPath);
+            if (!string.IsNullOrEmpty(finalPath) && File.Exists(finalPath))
+            {
+                try
+                {
+                    status = (status ?? "") + "  大小 " + RecordingName.FormatSize(new FileInfo(finalPath).Length) + "。";
+                }
+                catch { }
+            }
+            FinishIdle(status ?? "");
+            if (!string.IsNullOrEmpty(errorPopup) && !_shownError)
+            {
+                _shownError = true;
+                MessageBox.Show(this, errorPopup, "LoopTap");
+            }
+            OfferTrim();
+        }
+
+        string AttachDuration()
+        {
+            if (_rec == null) return _lastFile;
+            string path = string.IsNullOrEmpty(_lastFile) ? _rec.OutputPath : _lastFile;
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return path;
+            long frames = System.Threading.Interlocked.Read(ref _rec.Frames);
+            if (frames <= 0) return path;
+            double sec = _rec.SampleRate > 0 ? frames / (double)_rec.SampleRate : 0;
+            string dest = RecordingName.AvoidClash(RecordingName.WithDuration(path, sec), path);
+            if (!string.Equals(dest, path, StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    File.Move(path, dest);
+                    path = dest;
+                }
+                catch (Exception ex)
+                {
+                    Log("没能把时长写进文件名，仍用原来的文件：" + ex.Message);
+                }
+            }
+            _lastFile = path;
+            _rec.OutputPath = path;
+            try
+            {
+                Log("文件 " + RecordingName.FormatSize(new FileInfo(path).Length) + "  " + path);
+            }
+            catch { }
+            return path;
         }
 
         void FinishIdle(string status)
@@ -815,21 +856,5 @@ namespace LoopTap
             public int WindowCount;
         }
 
-        static string Safe(string name)
-        {
-            char[] bad = Path.GetInvalidFileNameChars();
-            StringBuilder sb = new StringBuilder(name.Length);
-            for (int i = 0; i < name.Length; i++)
-            {
-                char c = name[i];
-                bool invalid = false;
-                for (int j = 0; j < bad.Length; j++)
-                {
-                    if (bad[j] == c) { invalid = true; break; }
-                }
-                sb.Append(invalid ? '_' : c);
-            }
-            return sb.Length == 0 ? "proc" : sb.ToString();
-        }
     }
 }

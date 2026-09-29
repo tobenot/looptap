@@ -1,0 +1,7 @@
+LoopTap 录音文件名已改好，可以关旧窗口再开 bin\LoopTap.exe 看。
+
+文件名以日期时间开头，中间是窗口标题里的歌名和进程名，停录后加上时长。例如：
+20260929_222530_Prushka Sequence - Kevin Penkin_cloudmusic_03m12s.wav
+Chrome 标题里的「- 网易云音乐 - Google Chrome」会去掉，只留歌名。没有窗口标题时只用进程名。
+
+主窗口录完的状态/日志，以及裁剪窗，都会显示文件大小。build.bat 零警告，--selfcheck 已通过。样本没有改。
