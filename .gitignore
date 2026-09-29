@@ -9,3 +9,4 @@ looptap-crash.log
 # 测试产物（脚本保留）
 test/*.wav
 test/*.log
+.cursor/
