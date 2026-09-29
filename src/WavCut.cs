@@ -121,8 +121,107 @@ namespace LoopTap
             }
         }
 
-        // ponytail: 阈值 0.005。先点录制、后播放时开头几乎是 0，会被留在选区外。
-        // 很轻的开头也可能被算成空白，波形上的把手可以拖回去。升级：按文件自己的噪声底算阈值。
+        // ponytail: 一趟对数直方图，不存每帧。低于 1e-8 进静音桶，其余按 log10 每十倍 8 桶，百分位用桶下沿。
+        // pHigh >= pLow*8 时阈值 = pLow*4，否则 1e-5；再夹到 [1e-5, 0.05]。
+        // 和底噪贴在一起的轻声仍可能被切掉，波形把手可以拖回去。升级：让用户框一段噪声再估。
+        public static float NoiseThreshold(WavInfo info)
+        {
+            const float floor = 1e-5f;
+            const float cap = 0.05f;
+            const int per = 8;
+            const int steps = 8 * per;
+            int[] hist = new int[steps + 1];
+            long count = 0;
+            if (info.Frames <= 0 || info.DataBytes <= 0 || info.BlockAlign <= 0)
+                return floor;
+
+            int block = info.BlockAlign;
+            byte[] buf = new byte[65536 - (65536 % block)];
+            using (FileStream fs = new FileStream(info.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                fs.Position = info.DataOffset;
+                long left = info.DataBytes;
+                while (left >= block)
+                {
+                    int want = buf.Length;
+                    if (want > left) want = (int)left;
+                    int got = 0;
+                    while (got < want)
+                    {
+                        int n = fs.Read(buf, got, want - got);
+                        if (n <= 0) break;
+                        got += n;
+                    }
+                    got -= got % block;
+                    if (got <= 0) break;
+                    int framesHere = got / block;
+                    for (int i = 0; i < framesHere; i++)
+                    {
+                        int off = i * block;
+                        float loud = 0;
+                        for (int c = 0; c < info.Channels; c++)
+                        {
+                            float s = BitConverter.ToSingle(buf, off + c * 4);
+                            if (float.IsNaN(s)) s = 0;
+                            float a = s < 0 ? -s : s;
+                            if (a > loud) loud = a;
+                        }
+                        int bin = 0;
+                        if (loud >= 1e-8f)
+                        {
+                            int idx = (int)Math.Floor((Math.Log10(loud) + 8.0) * per);
+                            if (idx < 0) idx = 0;
+                            if (idx >= steps) idx = steps - 1;
+                            bin = idx + 1;
+                        }
+                        hist[bin]++;
+                        count++;
+                    }
+                    left -= got;
+                }
+            }
+            if (count <= 0) return floor;
+
+            long markLow = (count * 5 + 99) / 100;
+            long markHigh = (count * 95 + 99) / 100;
+            if (markLow < 1) markLow = 1;
+            if (markHigh < 1) markHigh = 1;
+            if (markHigh > count) markHigh = count;
+
+            int lowBin = 0;
+            int highBin = 0;
+            bool haveLow = false;
+            long acc = 0;
+            for (int i = 0; i < hist.Length; i++)
+            {
+                if (hist[i] == 0) continue;
+                acc += hist[i];
+                if (!haveLow && acc >= markLow)
+                {
+                    lowBin = i;
+                    haveLow = true;
+                }
+                if (acc >= markHigh)
+                {
+                    highBin = i;
+                    break;
+                }
+            }
+
+            float pLow = BinAmp(lowBin);
+            float pHigh = BinAmp(highBin);
+            float th = (pHigh >= pLow * 8f) ? pLow * 4f : floor;
+            if (th < floor) th = floor;
+            if (th > cap) th = cap;
+            return th;
+        }
+
+        static float BinAmp(int bin)
+        {
+            if (bin <= 0) return 0;
+            return (float)Math.Pow(10.0, -8.0 + (bin - 1) / 8.0);
+        }
+
         public static WavScan Scan(WavInfo info, int columns, float threshold)
         {
             if (columns < 1) columns = 1;
@@ -210,6 +309,18 @@ namespace LoopTap
                 audibleEnd = frame;
             }
             return new WavScan(min, max, audibleStart, audibleEnd);
+        }
+
+        public static string ChooseBackup(string wavPath, Predicate<string> taken)
+        {
+            string first = wavPath + ".bak.wav";
+            if (!taken(first)) return first;
+            for (int i = 2; i < 1000; i++)
+            {
+                string numbered = wavPath + ".bak" + i + ".wav";
+                if (!taken(numbered)) return numbered;
+            }
+            throw new InvalidOperationException("备份文件太多。");
         }
 
         public static void SaveRange(WavInfo info, long start, long end, string dest)
@@ -316,6 +427,65 @@ namespace LoopTap
                 }
                 WavScan quietScan = Scan(Open(quiet), 8, 0.005f);
                 Check(quietScan.AudibleStart == 0 && quietScan.AudibleEnd == 200, "全静音应保留整段");
+
+                string soft = path + ".soft";
+                int lead = 2000;
+                int quietTone = 400;
+                int hot = 400;
+                int tail = 2000;
+                int softFrames = lead + quietTone + hot + tail;
+                byte[] softPcm = new byte[softFrames * block];
+                byte[] amp002 = BitConverter.GetBytes(0.002f);
+                for (int i = lead; i < lead + quietTone; i++)
+                {
+                    Buffer.BlockCopy(amp002, 0, softPcm, i * block, 4);
+                    Buffer.BlockCopy(amp002, 0, softPcm, i * block + 4, 4);
+                }
+                for (int i = lead + quietTone; i < lead + quietTone + hot; i++)
+                {
+                    Buffer.BlockCopy(half, 0, softPcm, i * block, 4);
+                    Buffer.BlockCopy(half, 0, softPcm, i * block + 4, 4);
+                }
+                using (WavWriter w = new WavWriter(soft, channels, rate, 32, block, 3))
+                {
+                    w.Write(softPcm, softPcm.Length);
+                    w.Finish();
+                }
+                WavInfo softInfo = Open(soft);
+                float softTh = NoiseThreshold(softInfo);
+                WavScan softScan = Scan(softInfo, 32, softTh);
+                Check(softScan.AudibleStart == lead && softScan.AudibleEnd == lead + quietTone + hot,
+                    "轻开头被切掉了：" + softScan.AudibleStart + ".." + softScan.AudibleEnd + " th=" + softTh);
+
+                string floorWav = path + ".floor";
+                int noiseN = 2000;
+                int toneN = 400;
+                int floorFrames = noiseN + toneN + noiseN;
+                byte[] floorPcm = new byte[floorFrames * block];
+                byte[] amp01 = BitConverter.GetBytes(0.01f);
+                for (int i = 0; i < floorFrames; i++)
+                {
+                    Buffer.BlockCopy(amp01, 0, floorPcm, i * block, 4);
+                    Buffer.BlockCopy(amp01, 0, floorPcm, i * block + 4, 4);
+                }
+                for (int i = noiseN; i < noiseN + toneN; i++)
+                {
+                    Buffer.BlockCopy(half, 0, floorPcm, i * block, 4);
+                    Buffer.BlockCopy(half, 0, floorPcm, i * block + 4, 4);
+                }
+                using (WavWriter w = new WavWriter(floorWav, channels, rate, 32, block, 3))
+                {
+                    w.Write(floorPcm, floorPcm.Length);
+                    w.Finish();
+                }
+                WavInfo floorInfo = Open(floorWav);
+                float floorTh = NoiseThreshold(floorInfo);
+                WavScan floorScan = Scan(floorInfo, 32, floorTh);
+                Check(floorScan.AudibleStart == noiseN && floorScan.AudibleEnd == noiseN + toneN,
+                    "底噪被算进选区了：" + floorScan.AudibleStart + ".." + floorScan.AudibleEnd + " th=" + floorTh);
+
+                string bak = ChooseBackup(path, delegate(string candidate) { return candidate.EndsWith(".bak.wav", StringComparison.Ordinal); });
+                Check(bak.EndsWith(".bak2.wav", StringComparison.Ordinal), "备份文件名没有避开已有文件");
             }
             finally
             {
@@ -324,6 +494,8 @@ namespace LoopTap
                 try { File.Delete(quiet); } catch { }
                 try { File.Delete(path + ".keep.wav"); } catch { }
                 try { File.Delete(path + ".keep.wav.part"); } catch { }
+                try { File.Delete(path + ".soft"); } catch { }
+                try { File.Delete(path + ".floor"); } catch { }
             }
         }
 

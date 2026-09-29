@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -37,7 +38,16 @@ namespace LoopTap
             // ponytail: WAV 块大小是 32 位，单文件约 4GB。更长的录音要换 RF64。
             if (_dataBytes + count > 0xFFFFFFF0L)
                 throw new InvalidOperationException("录音超过 WAV 单文件上限（约 4GB），已停止。");
-            _fs.Write(data, 0, count);
+            try
+            {
+                _fs.Write(data, 0, count);
+            }
+            catch (IOException)
+            {
+                try { FitStream(_fs, Header(_channels, _rate, _bits, _blockAlign, _channelMask, _dataBytes)); }
+                catch { }
+                throw new InvalidOperationException("磁盘已满，录音停在最后一个完整位置。已经写入的部分仍是合法 WAV。");
+            }
             _dataBytes += count;
             if (_dataBytes - _patchedAt >= (long)_rate * _blockAlign)
                 Patch();
@@ -63,6 +73,46 @@ namespace LoopTap
         byte[] BuildHeader(long dataBytes)
         {
             return Header(_channels, _rate, _bits, _blockAlign, _channelMask, dataBytes);
+        }
+
+        public static void FitStream(FileStream fs, byte[] header)
+        {
+            uint data = BitConverter.ToUInt32(header, 64);
+            fs.SetLength(header.Length + data);
+            fs.Position = 0;
+            fs.Write(header, 0, header.Length);
+            fs.Flush();
+        }
+
+        public static void SelfCheck()
+        {
+            string path = Path.Combine(Path.GetTempPath(), "looptap-wavfit-selfcheck.wav");
+            try
+            {
+                byte[] pcm = new byte[160];
+                using (WavWriter w = new WavWriter(path, 2, 48000, 32, 8, 3))
+                {
+                    w.Write(pcm, pcm.Length);
+                    w.Finish();
+                }
+                using (FileStream fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                {
+                    byte[] junk = new byte[64];
+                    for (int i = 0; i < junk.Length; i++) junk[i] = 0xFF;
+                    fs.Write(junk, 0, junk.Length);
+                }
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+                    FitStream(fs, Header(2, 48000, 32, 8, 3, pcm.Length));
+                WavInfo info = WavCut.Open(path);
+                if (info.Frames != 20 || info.DataBytes != pcm.Length)
+                    throw new InvalidOperationException("磁盘满时收回的 WAV 长度不对。");
+                if (new FileInfo(path).Length != 68 + pcm.Length)
+                    throw new InvalidOperationException("多余的尾部没有裁掉。");
+            }
+            finally
+            {
+                try { File.Delete(path); } catch { }
+            }
         }
 
         public static byte[] Header(int channels, int rate, int bits, int blockAlign, int channelMask, long dataBytes)
@@ -156,7 +206,14 @@ namespace LoopTap
         public long Frames;
         public long AudibleFrames;
         public float Peak;
+        public int DiscCount;
         public string OutputPath;
+        readonly object _peakLock = new object();
+
+        public float ReadPeak()
+        {
+            lock (_peakLock) return Peak;
+        }
 
         public LoopbackRecorder(int pid, string path, Action<string> log)
         {
@@ -281,21 +338,23 @@ namespace LoopTap
                         audioEvent.WaitOne(50);
                     else
                         Thread.Sleep(10);
-                    Drain(capture, wav, block, ref buf);
                     long now = Environment.TickCount;
                     if (unchecked(now - lastLog) >= 1000)
                     {
                         lastLog = now;
+                        if (!ProcessAlive(_pid))
+                            throw new InvalidOperationException("目标进程已退出。");
                         long frames = Interlocked.Read(ref Frames);
                         _log(string.Format("已录 {0:0.0} 秒", frames / (double)fmt.SampleRate));
                     }
+                    Drain(capture, wav, block, ref buf);
                 }
                 Drain(capture, wav, block, ref buf);
             }
             catch (Exception ex)
             {
                 Failed = true;
-                Error = ex is InvalidOperationException ? ex.Message : ("录制中断：" + ex.Message);
+                Error = ProcessIdentity.FailureText(ProcessAlive(_pid), ex.Message);
                 _log(Error);
             }
             finally
@@ -342,12 +401,17 @@ namespace LoopTap
                     audioEvent.Close();
 
                 long framesDone = Interlocked.Read(ref Frames);
-                if (StartSucceeded && framesDone > 0)
+                if (Failed)
+                {
+                    Summary = Error;
+                }
+                else if (StartSucceeded && framesDone > 0)
                 {
                     double sec = SampleRate > 0 ? framesDone / (double)SampleRate : 0;
+                    string disc = DiscCount > 0 ? ("，间断 " + DiscCount + " 次（没有补静音）") : "";
                     Summary = string.Format(
-                        "录制完成。时长 {0:0.00} 秒，采样率 {1}，声道 {2}，位深 {3}，格式 float，非静音帧 {4}，峰值 {5:0.000}，文件 {6}",
-                        sec, SampleRate, Channels, Bits, Interlocked.Read(ref AudibleFrames), Peak, OutputPath);
+                        "录制完成。时长 {0:0.00} 秒，采样率 {1}，声道 {2}，位深 {3}，格式 float，非静音帧 {4}，峰值 {5:0.000}{6}，文件 {7}",
+                        sec, SampleRate, Channels, Bits, Interlocked.Read(ref AudibleFrames), ReadPeak(), disc, OutputPath);
                     _log(Summary);
                     _log(string.Format(
                         "验收 采样率={0} 声道={1} 位深={2} 格式=float 编码=pcm_f32le 帧数={3}",
@@ -356,10 +420,6 @@ namespace LoopTap
                 else if (Cancelled)
                 {
                     Summary = "已取消。";
-                }
-                else if (Failed)
-                {
-                    Summary = Error;
                 }
 
                 Running = false;
@@ -480,21 +540,40 @@ namespace LoopTap
 
         void NoteDiscontinuity()
         {
+            DiscCount++;
             if (_loggedDisc) return;
             _loggedDisc = true;
-            _log("音频出现不连续（刚开始出声或中间断过），已原样写入。");
+            _log("音频不连续。文件按拿到的样本拼接，不补静音。");
         }
 
         void UpdatePeak(byte[] data, int bytes)
         {
-            float peak = Peak;
+            float peak = ReadPeak();
             for (int i = 0; i + 4 <= bytes; i += 4)
             {
                 float s = BitConverter.ToSingle(data, i);
+                if (float.IsNaN(s)) continue;
                 if (s < 0) s = -s;
                 if (s > peak) peak = s;
             }
-            Peak = peak;
+            lock (_peakLock) Peak = peak;
+        }
+
+        static bool ProcessAlive(int pid)
+        {
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                    return !p.HasExited;
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
+            catch
+            {
+                return true;
+            }
         }
 
         static void Check(int hr, string action)

@@ -16,6 +16,7 @@ namespace LoopTap
         readonly Button _play;
         readonly Button _align;
         readonly Button _save;
+        readonly Button _saveAs;
         readonly System.Windows.Forms.Timer _playTimer;
         readonly ManualResetEvent _playDone = new ManualResetEvent(true);
         string _path;
@@ -28,12 +29,15 @@ namespace LoopTap
         volatile bool _playing;
         long _playFrame = -1;
         bool _justSaved;
+        bool _saving;
+        string _savedExtra;
 
         public TrimForm(string path)
         {
             _path = path;
             Text = "裁剪录音";
-            StartPosition = FormStartPosition.CenterParent;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.Dpi;
             Width = 900;
             Height = 520;
             MinimumSize = new Size(720, 380);
@@ -67,7 +71,15 @@ namespace LoopTap
             _save.Width = 110;
             _save.Height = 30;
             _save.Enabled = false;
-            _save.Click += delegate { SaveCut(); };
+            _save.Click += delegate { SaveCut(true); };
+
+            _saveAs = new Button();
+            _saveAs.Text = "另存为";
+            _saveAs.Top = 8;
+            _saveAs.Width = 90;
+            _saveAs.Height = 30;
+            _saveAs.Enabled = false;
+            _saveAs.Click += delegate { SaveCut(false); };
 
             _hint = new Label();
             _hint.AutoSize = false;
@@ -80,14 +92,15 @@ namespace LoopTap
             _detail.AutoSize = false;
             _detail.Left = 8;
             _detail.Top = 82;
-            _detail.Height = 36;
+            _detail.Height = 48;
             _detail.Text = "";
 
             _bar = new Panel();
-            _bar.Height = 126;
+            _bar.Height = 140;
             _bar.Controls.Add(_play);
             _bar.Controls.Add(_align);
             _bar.Controls.Add(_save);
+            _bar.Controls.Add(_saveAs);
             _bar.Controls.Add(_hint);
             _bar.Controls.Add(_detail);
             _bar.Resize += delegate { LayoutBar(); };
@@ -109,6 +122,18 @@ namespace LoopTap
             _playTimer.Start();
         }
 
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            ScreenPlace.CenterOnOwner(this);
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            PerformLayout();
+        }
+
         public void LoadFile(string path)
         {
             LoadCore(path, false);
@@ -124,6 +149,7 @@ namespace LoopTap
             _info = info;
             _scan = null;
             _justSaved = saved;
+            if (!saved) _savedExtra = null;
             Interlocked.Exchange(ref _playFrame, -1);
             Text = "裁剪录音 — " + Path.GetFileName(path);
             _hint.Text = "正在看波形……";
@@ -131,6 +157,7 @@ namespace LoopTap
             _play.Enabled = false;
             _align.Enabled = false;
             _save.Enabled = false;
+            _saveAs.Enabled = false;
             BeginScan(true);
         }
 
@@ -175,10 +202,11 @@ namespace LoopTap
         {
             int w = _bar.ClientSize.Width;
             _save.Left = w - _save.Width - 8;
+            _saveAs.Left = _save.Left - _saveAs.Width - 8;
             _play.Left = 8;
             _align.Left = _play.Right + 8;
-            if (_align.Right > _save.Left - 8)
-                _align.Left = _save.Left - _align.Width - 8;
+            if (_align.Right > _saveAs.Left - 8)
+                _align.Left = _saveAs.Left - _align.Width - 8;
             _hint.Width = w - 16;
             _detail.Width = w - 16;
         }
@@ -195,7 +223,7 @@ namespace LoopTap
             {
                 WavScan scan = null;
                 Exception err = null;
-                try { scan = WavCut.Scan(info, cols, 0.005f); }
+                try { scan = WavCut.Scan(info, cols, WavCut.NoiseThreshold(info)); }
                 catch (Exception ex) { err = ex; }
                 try
                 {
@@ -222,9 +250,13 @@ namespace LoopTap
                             _end = info.Frames;
                         }
                         _wave.ShowScan(scan.Min, scan.Max, info.Frames, _start, _end);
-                        _play.Enabled = true;
-                        _align.Enabled = true;
-                        _save.Enabled = true;
+                        if (!_saving)
+                        {
+                            _play.Enabled = true;
+                            _align.Enabled = true;
+                            _save.Enabled = true;
+                            _saveAs.Enabled = true;
+                        }
                         UpdateText();
                     }));
                 }
@@ -275,7 +307,7 @@ namespace LoopTap
             double lead = _start / (double)_info.Rate;
             double tailSec = (_info.Frames - _end) / (double)_info.Rate;
             double keep = (_end - _start) / (double)_info.Rate;
-            string prefix = _justSaved ? "已保存。" : "";
+            string prefix = _justSaved ? (_savedExtra ?? "已保存。") : "";
             _detail.Text = prefix + string.Format(
                 "开头去掉 {0}，结尾去掉 {1}，留下 {2}（{3} 个采样点，原样拷贝）。",
                 Clock(lead), Clock(tailSec), Clock(keep), _end - _start);
@@ -332,9 +364,9 @@ namespace LoopTap
             catch (InvalidOperationException) { }
         }
 
-        void SaveCut()
+        void SaveCut(bool replaceOriginal)
         {
-            if (_info == null) return;
+            if (_saving || _info == null) return;
             if (_start <= 0 && _end >= _info.Frames)
             {
                 MessageBox.Show(this, "选区已经是整段，没有要裁掉的部分。", "LoopTap");
@@ -347,11 +379,36 @@ namespace LoopTap
             }
             double lead = _start / (double)_info.Rate;
             double tailSec = (_info.Frames - _end) / (double)_info.Rate;
-            string msg = string.Format(
-                "开头去掉 {0}，结尾去掉 {1}。\r\n留下的采样点原样拷贝，不改采样率和位深。\r\n原文件会被替换。",
-                Clock(lead), Clock(tailSec));
-            if (MessageBox.Show(this, msg, "LoopTap", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
-                return;
+            string path = _info.Path;
+            string dest = path;
+            string backup = null;
+            if (replaceOriginal)
+            {
+                backup = WavCut.ChooseBackup(path, delegate(string candidate) { return File.Exists(candidate); });
+                string msg = string.Format(
+                    "开头去掉 {0}，结尾去掉 {1}。\r\n留下的采样点原样拷贝，不改采样率和位深。\r\n这条录音会换成裁剪结果。完整原件留在：\r\n{2}",
+                    Clock(lead), Clock(tailSec), backup);
+                if (MessageBox.Show(this, msg, "LoopTap", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
+                    return;
+            }
+            else
+            {
+                SaveFileDialog dlg = new SaveFileDialog();
+                dlg.Filter = "WAV (*.wav)|*.wav";
+                dlg.Title = "另存裁剪结果";
+                dlg.OverwritePrompt = true;
+                try { dlg.InitialDirectory = Path.GetDirectoryName(path); }
+                catch { }
+                string baseName = Path.GetFileNameWithoutExtension(path);
+                dlg.FileName = baseName + "_裁剪.wav";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                dest = dlg.FileName;
+                if (string.Equals(Path.GetFullPath(dest), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase))
+                {
+                    MessageBox.Show(this, "另存请换一个文件名。要用原文件名，点「保存裁剪」，完整原件会留成备份。", "LoopTap");
+                    return;
+                }
+            }
 
             _playing = false;
             if (!_playDone.WaitOne(3000))
@@ -360,30 +417,80 @@ namespace LoopTap
                 return;
             }
 
-            string path = _info.Path;
-            string tmp = path + ".part";
-            try
+            _saving = true;
+            _save.Enabled = false;
+            _saveAs.Enabled = false;
+            _play.Enabled = false;
+            WavInfo info = _info;
+            long a = _start;
+            long b = _end;
+            string finalDest = dest;
+            string bak = backup;
+            bool replace = replaceOriginal;
+            Thread t = new Thread(new ThreadStart(delegate
             {
-                // ponytail: 拷贝在界面线程上做。家用录音一般几秒到几分钟，拷完就返回。
-                // 接近 4GB 时窗口会卡住，那时再改成后台拷贝。
-                WavCut.SaveRange(_info, _start, _end, tmp);
-                File.Replace(tmp, path, null);
-            }
-            catch (Exception ex)
-            {
-                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
-                MessageBox.Show(this, "保存失败：" + ex.Message + "\r\n原文件还在。", "LoopTap");
-                return;
-            }
-
-            try
-            {
-                LoadCore(path, true);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "已经保存，但重新打开失败：" + ex.Message, "LoopTap");
-            }
+                string err = null;
+                string reopen = finalDest;
+                try
+                {
+                    if (replace)
+                    {
+                        string tmp = path + ".part";
+                        try
+                        {
+                            WavCut.SaveRange(info, a, b, tmp);
+                            File.Replace(tmp, path, bak);
+                        }
+                        catch
+                        {
+                            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                            throw;
+                        }
+                        reopen = path;
+                    }
+                    else
+                    {
+                        WavCut.SaveRange(info, a, b, finalDest);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    err = ex.Message;
+                }
+                string error = err;
+                string openPath = reopen;
+                string note = replace
+                    ? "已保存。完整原件留在 " + Path.GetFileName(bak) + "。"
+                    : "已另存，原来的录音没动。";
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        _saving = false;
+                        if (IsDisposed) return;
+                        if (error != null)
+                        {
+                            _play.Enabled = true;
+                            _save.Enabled = true;
+                            _saveAs.Enabled = true;
+                            MessageBox.Show(this, "保存失败：" + error + "\r\n原文件还在。", "LoopTap");
+                            return;
+                        }
+                        _savedExtra = note;
+                        try { LoadCore(openPath, true); }
+                        catch (Exception ex)
+                        {
+                            _play.Enabled = true;
+                            _save.Enabled = true;
+                            _saveAs.Enabled = true;
+                            MessageBox.Show(this, "已经保存，但重新打开失败：" + ex.Message, "LoopTap");
+                        }
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            }));
+            t.IsBackground = false;
+            t.Start();
         }
 
         static string Clock(double sec)

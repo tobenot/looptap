@@ -11,14 +11,22 @@ namespace LoopTap
 
         public static void Apply(List<ProcItem> list)
         {
-            Dictionary<int, string> titles = WindowTitles();
+            Dictionary<int, List<string>> titles = WindowTitles();
             for (int i = 0; i < list.Count; i++)
             {
-                string title;
-                if (titles.TryGetValue(list[i].Pid, out title))
-                    list[i].Title = title;
+                List<string> wins;
+                if (titles.TryGetValue(list[i].Pid, out wins) && wins.Count > 0)
+                {
+                    list[i].Windows = wins;
+                    list[i].Title = wins[0];
+                    list[i].WindowCount = wins.Count;
+                }
                 else
+                {
+                    list[i].Windows = new List<string>();
                     list[i].Title = "";
+                    list[i].WindowCount = 0;
+                }
             }
             UpdatePlaying(list);
         }
@@ -100,8 +108,45 @@ namespace LoopTap
             return mark;
         }
 
+        public static List<string> CleanTitles(List<string> raw)
+        {
+            List<string> list = new List<string>();
+            if (raw == null) return list;
+            for (int i = 0; i < raw.Count; i++)
+            {
+                if (list.Count >= 12) break;
+                string title = raw[i] == null ? "" : raw[i].Trim();
+                if (title.Length == 0) continue;
+                if (title.Length > 160) title = title.Substring(0, 160);
+                bool dup = false;
+                for (int j = 0; j < list.Count; j++)
+                {
+                    if (string.Equals(list[j], title, StringComparison.Ordinal))
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) list.Add(title);
+            }
+            return list;
+        }
+
         public static void SelfCheck()
         {
+            List<string> raw = new List<string>();
+            raw.Add("  页A ");
+            raw.Add("");
+            raw.Add("页A");
+            raw.Add("页B");
+            List<string> clean = CleanTitles(raw);
+            if (clean.Count != 2 || clean[0] != "页A" || clean[1] != "页B")
+                throw new InvalidOperationException("同一进程的窗口标题没有分开保留。");
+            raw.Clear();
+            for (int i = 0; i < 20; i++) raw.Add("窗" + i);
+            if (CleanTitles(raw).Count != 12)
+                throw new InvalidOperationException("窗口标题没有在 12 条处停住。");
+
             Dictionary<int, int> parent = new Dictionary<int, int>();
             parent[30] = 20;
             parent[20] = 10;
@@ -142,9 +187,9 @@ namespace LoopTap
                 throw new InvalidOperationException("父子成环时没有停住。");
         }
 
-        static Dictionary<int, string> WindowTitles()
+        static Dictionary<int, List<string>> WindowTitles()
         {
-            Dictionary<int, string> map = new Dictionary<int, string>();
+            Dictionary<int, List<string>> map = new Dictionary<int, List<string>>();
             EnumWindows(delegate(IntPtr hwnd, IntPtr lparam)
             {
                 if (!IsWindowVisible(hwnd)) return true;
@@ -161,28 +206,20 @@ namespace LoopTap
                 uint pid;
                 GetWindowThreadProcessId(hwnd, out pid);
                 if (pid <= 4) return true;
-                RememberTitle(map, unchecked((int)pid), sb.ToString());
+                int key = unchecked((int)pid);
+                List<string> bucket;
+                if (!map.TryGetValue(key, out bucket))
+                {
+                    bucket = new List<string>();
+                    map[key] = bucket;
+                }
+                bucket.Add(sb.ToString());
                 return true;
             }, IntPtr.Zero);
+            List<int> keys = new List<int>(map.Keys);
+            for (int i = 0; i < keys.Count; i++)
+                map[keys[i]] = CleanTitles(map[keys[i]]);
             return map;
-        }
-
-        static void RememberTitle(Dictionary<int, string> map, int pid, string title)
-        {
-            title = title.Trim();
-            if (title.Length == 0) return;
-            if (title.Length > 160) title = title.Substring(0, 160);
-            string old;
-            if (!map.TryGetValue(pid, out old))
-            {
-                map[pid] = title;
-                return;
-            }
-            if (string.Equals(old, title, StringComparison.Ordinal)) return;
-            if (old.IndexOf(title, StringComparison.Ordinal) >= 0) return;
-            string merged = title.Length >= old.Length ? title + " | " + old : old + " | " + title;
-            if (merged.Length > 180) merged = merged.Substring(0, 180);
-            map[pid] = merged;
         }
 
         static void Parents(out Dictionary<int, int> parentOf, out Dictionary<int, string> nameOf)
@@ -224,9 +261,41 @@ namespace LoopTap
             IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
             try
             {
-                Collect(en, 0, set);
-                Collect(en, 1, set);
-                Collect(en, 2, set);
+                bool enumerated = false;
+                IMMDeviceCollection col = null;
+                try
+                {
+                    int hr = en.EnumAudioEndpoints(0, 1, out col);
+                    uint count;
+                    if (hr == 0 && col != null && col.GetCount(out count) == 0 && count > 0)
+                    {
+                        enumerated = true;
+                        if (count > 32) count = 32;
+                        for (uint i = 0; i < count; i++)
+                        {
+                            IMMDevice dev = null;
+                            try
+                            {
+                                if (col.Item(i, out dev) == 0 && dev != null)
+                                    CollectDevice(dev, set);
+                            }
+                            finally
+                            {
+                                Release(dev);
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    Release(col);
+                }
+                if (!enumerated)
+                {
+                    Collect(en, 0, set);
+                    Collect(en, 1, set);
+                    Collect(en, 2, set);
+                }
             }
             finally
             {
@@ -238,14 +307,26 @@ namespace LoopTap
         static void Collect(IMMDeviceEnumerator en, int role, HashSet<int> set)
         {
             IMMDevice device = null;
-            object mgrObj = null;
-            IAudioSessionEnumerator sessions = null;
             try
             {
                 int hr = en.GetDefaultAudioEndpoint(0, role, out device);
                 if (hr != 0 || device == null) return;
+                CollectDevice(device, set);
+            }
+            finally
+            {
+                Release(device);
+            }
+        }
+
+        static void CollectDevice(IMMDevice device, HashSet<int> set)
+        {
+            object mgrObj = null;
+            IAudioSessionEnumerator sessions = null;
+            try
+            {
                 Guid iid = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
-                hr = device.Activate(ref iid, 23, IntPtr.Zero, out mgrObj);
+                int hr = device.Activate(ref iid, 23, IntPtr.Zero, out mgrObj);
                 if (hr != 0 || mgrObj == null) return;
                 hr = ((IAudioSessionManager2)mgrObj).GetSessionEnumerator(out sessions);
                 if (hr != 0 || sessions == null) return;
@@ -278,7 +359,6 @@ namespace LoopTap
             {
                 Release(sessions);
                 Release(mgrObj);
-                Release(device);
             }
         }
 

@@ -30,6 +30,7 @@ namespace LoopTap
         readonly Button _browse;
         readonly Button _openDir;
         readonly Button _trimBtn;
+        readonly Button _openWav;
         readonly TextBox _dirBox;
         readonly CheckBox _hideBg;
         readonly Timer _timer;
@@ -42,6 +43,7 @@ namespace LoopTap
         string _lastFile;
         int _uiTick;
         TrimForm _trim;
+        string _refreshError;
 
         public MainForm()
         {
@@ -50,6 +52,7 @@ namespace LoopTap
             Width = 920;
             Height = 680;
             MinimumSize = new Size(780, 540);
+            AutoScaleMode = AutoScaleMode.Dpi;
             try { Font = new Font("Microsoft YaHei UI", 9f); }
             catch { }
 
@@ -59,7 +62,7 @@ namespace LoopTap
             hint.Top = 8;
             hint.Height = 32;
             hint.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
-            hint.Text = "点标黄的那一行再录。浏览器认网页标题。";
+            hint.Text = "点标黄的那一行再录。同一进程里的窗口会一起录进去。";
 
             _filter = new TextBox();
             _filter.Left = 8;
@@ -171,11 +174,19 @@ namespace LoopTap
             _trimBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _trimBtn.Click += delegate { OpenTrim(_lastFile); };
 
+            _openWav = new Button();
+            _openWav.Text = "打开录音";
+            _openWav.Top = 42;
+            _openWav.Width = 88;
+            _openWav.Height = 28;
+            _openWav.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _openWav.Click += delegate { OpenWav(); };
+
             _status = new Label();
             _status.AutoSize = false;
             _status.Left = 8;
             _status.Top = 76;
-            _status.Height = 36;
+            _status.Height = 48;
             _status.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
             _status.Text = "就绪。选择进程后点「开始录制」。";
 
@@ -184,7 +195,7 @@ namespace LoopTap
             _logBox.ReadOnly = true;
             _logBox.ScrollBars = ScrollBars.Vertical;
             _logBox.Left = 8;
-            _logBox.Top = 116;
+            _logBox.Top = 128;
             _logBox.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom;
             _logBox.Font = Font;
 
@@ -198,6 +209,7 @@ namespace LoopTap
             bottom.Controls.Add(dirLabel);
             bottom.Controls.Add(_dirBox);
             bottom.Controls.Add(_trimBtn);
+            bottom.Controls.Add(_openWav);
             bottom.Controls.Add(_browse);
             bottom.Controls.Add(_status);
             bottom.Controls.Add(_logBox);
@@ -207,7 +219,9 @@ namespace LoopTap
                 _browse.Left = bottom.ClientSize.Width - _browse.Width - 8;
                 _trimBtn.Left = _browse.Left - _trimBtn.Width - 8;
                 _trimBtn.Top = _browse.Top;
-                int dirW = _trimBtn.Left - 8 - _dirBox.Left;
+                _openWav.Left = _trimBtn.Left - _openWav.Width - 8;
+                _openWav.Top = _browse.Top;
+                int dirW = _openWav.Left - 8 - _dirBox.Left;
                 if (dirW < 80) dirW = 80;
                 _dirBox.Width = dirW;
                 _status.Width = bottom.ClientSize.Width - 16;
@@ -239,6 +253,7 @@ namespace LoopTap
                 bottom.BringToFront();
             };
             OnResize(EventArgs.Empty);
+            ScreenPlace.CenterOnCursor(this);
 
             _timer = new Timer();
             _timer.Interval = 200;
@@ -246,6 +261,12 @@ namespace LoopTap
             _timer.Start();
 
             FormClosing += OnClosing;
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            PerformLayout();
         }
 
         protected override void OnShown(EventArgs e)
@@ -294,14 +315,21 @@ namespace LoopTap
 
         void FillList(bool writeLog)
         {
-            int keep = -1;
+            RowRef keep = null;
             if (_list.SelectedItems.Count > 0)
-                keep = (int)_list.SelectedItems[0].Tag;
+                keep = _list.SelectedItems[0].Tag as RowRef;
+            int scroll = 0;
+            try
+            {
+                if (_list.TopItem != null) scroll = _list.TopItem.Index;
+            }
+            catch { }
 
             string filter = _filter.Text.Trim();
             int hidden = 0;
             int playingShown = 0;
             string onePlaying = "";
+            bool pidReused = false;
             _list.BeginUpdate();
             try
             {
@@ -323,7 +351,8 @@ namespace LoopTap
                         if (!hit) continue;
                     }
                     string note = "";
-                    if (p.Playing) note = "正在出声";
+                    if (p.Playing) note = p.WindowCount > 1 ? "出声·整进程" : "正在出声";
+                    else if (p.WindowCount > 1) note = "整进程";
                     else if (p.Browser) note = "浏览器";
                     string title = p.Title ?? "";
                     if (p.Playing && title.Length == 0)
@@ -332,7 +361,22 @@ namespace LoopTap
                     item.SubItems.Add(title);
                     item.SubItems.Add(p.Name);
                     item.SubItems.Add(p.Pid.ToString());
-                    item.Tag = p.Pid;
+                    RowRef row = new RowRef();
+                    row.Pid = p.Pid;
+                    row.StartTicks = p.StartTicks;
+                    row.Name = p.Name;
+                    row.Title = title;
+                    row.WindowCount = p.WindowCount;
+                    item.Tag = row;
+                    if (keep != null && keep.Pid == p.Pid)
+                    {
+                        bool ticksOk = keep.StartTicks == 0 || p.StartTicks == 0 || keep.StartTicks == p.StartTicks;
+                        bool titleOk = string.Equals(keep.Title, title, StringComparison.Ordinal);
+                        if (ticksOk && titleOk)
+                            item.Selected = true;
+                        else if (!ticksOk)
+                            pidReused = true;
+                    }
                     if (p.Playing)
                         item.BackColor = Color.FromArgb(255, 244, 180);
                     _list.Items.Add(item);
@@ -342,19 +386,17 @@ namespace LoopTap
                         if (onePlaying.Length == 0)
                             onePlaying = title.Length > 0 ? title : p.Name;
                     }
-                    if (p.Pid == keep)
-                        item.Selected = true;
                 }
             }
             finally
             {
                 _list.EndUpdate();
             }
-            if (_list.SelectedItems.Count == 0 && playingShown == 1 && _list.Items.Count > 0)
+            if (!pidReused && _list.SelectedItems.Count == 0 && playingShown == 1 && _list.Items.Count > 0)
             {
                 for (int i = 0; i < _list.Items.Count; i++)
                 {
-                    if (_list.Items[i].Text == "正在出声")
+                    if (_list.Items[i].Text.IndexOf("出声", StringComparison.Ordinal) >= 0)
                     {
                         _list.Items[i].Selected = true;
                         break;
@@ -363,10 +405,18 @@ namespace LoopTap
             }
             if (_list.SelectedItems.Count > 0)
                 _list.SelectedItems[0].EnsureVisible();
+            else if (scroll > 0 && scroll < _list.Items.Count)
+            {
+                try { _list.TopItem = _list.Items[scroll]; }
+                catch { }
+            }
 
             if (_state == RunState.Idle)
             {
                 string summary;
+                if (pidReused)
+                    summary = "有一个 PID 已经换成了别的进程，请重新选择。";
+                else
                 if (playingShown == 1)
                     summary = "正在出声：" + onePlaying + "。点这一行再开始录制。";
                 else if (playingShown > 1)
@@ -377,6 +427,9 @@ namespace LoopTap
                     summary += " 显示 " + _list.Items.Count + " 行，已隐藏 " + hidden + " 个没窗口的后台进程。";
                 else
                     summary += " 正在显示全部 " + _list.Items.Count + " 个进程。";
+                RowRef sel = _list.SelectedItems.Count > 0 ? _list.SelectedItems[0].Tag as RowRef : null;
+                if (sel != null && sel.WindowCount > 1)
+                    summary += " 选中的这一行会录下整个进程（" + sel.WindowCount + " 个窗口）。";
                 _status.Text = summary;
                 if (writeLog)
                     Log(summary);
@@ -391,11 +444,22 @@ namespace LoopTap
                 MessageBox.Show(this, "请先在列表里选一个进程。", "LoopTap");
                 return;
             }
-            int pid = (int)_list.SelectedItems[0].Tag;
-            string name = _list.SelectedItems[0].SubItems[2].Text;
+            RowRef row = _list.SelectedItems[0].Tag as RowRef;
+            if (row == null) return;
+            int pid = row.Pid;
+            string name = row.Name;
             try
             {
-                System.Diagnostics.Process.GetProcessById(pid).Dispose();
+                using (System.Diagnostics.Process live = System.Diagnostics.Process.GetProcessById(pid))
+                {
+                    long ticks = ProcessIdentity.ReadStartTicks(live);
+                    if (!ProcessIdentity.Same(row.Name, row.StartTicks, live.ProcessName, ticks))
+                    {
+                        MessageBox.Show(this, "这个 PID 已经是另一个进程。列表会刷新，请重新选。", "LoopTap");
+                        RefreshQuiet();
+                        return;
+                    }
+                }
             }
             catch
             {
@@ -434,6 +498,7 @@ namespace LoopTap
             _dirBox.Enabled = false;
             _browse.Enabled = false;
             _trimBtn.Enabled = false;
+            _openWav.Enabled = false;
             _stop.Enabled = true;
             _status.Text = "正在连接进程回环……";
             Text = "LoopTap 进程内录 — 正在启动";
@@ -454,18 +519,8 @@ namespace LoopTap
         {
             DrainLogs();
             _uiTick++;
-            if (_state == RunState.Idle && (_uiTick % 5) == 0 && _cache.Count > 0)
-            {
-                try
-                {
-                    if (WhoPlays.UpdatePlaying(_cache))
-                        FillList(false);
-                }
-                catch (Exception ex)
-                {
-                    Log("刷新正在出声失败：" + ex.Message);
-                }
-            }
+            if (_state == RunState.Idle && (_uiTick % 10) == 0)
+                RefreshQuiet();
             if (_rec == null) return;
 
             if (_state == RunState.Starting && _rec.WaitStarted(0))
@@ -504,6 +559,12 @@ namespace LoopTap
                 int rate = _rec.SampleRate;
                 double sec = rate > 0 ? frames / (double)rate : 0;
                 _duration.Text = "时长 " + FormatDuration(sec);
+                float peak = _rec.ReadPeak();
+                string warn = "";
+                if (sec >= 2 && peak < 0.001f)
+                    warn = "\r\n几乎没有声音。可能选错了进程，或对方用了独占模式，那种声音录不进来。";
+                string disc = _rec.DiscCount > 0 ? ("  间断 " + _rec.DiscCount + " 次，不补静音。") : "";
+                _status.Text = "正在录制  " + Meter(peak) + "  峰值 " + peak.ToString("0.000") + disc + warn;
                 if (!_rec.Running && _rec.WaitStarted(0))
                 {
                     string done = _rec.Summary;
@@ -531,6 +592,7 @@ namespace LoopTap
             _dirBox.Enabled = true;
             _browse.Enabled = true;
             _trimBtn.Enabled = true;
+            _openWav.Enabled = true;
             _stop.Enabled = false;
             _status.Text = status;
             Text = "LoopTap 进程内录";
@@ -545,6 +607,43 @@ namespace LoopTap
             {
                 if (!IsDisposed) OpenTrim(path);
             }));
+        }
+
+        void RefreshQuiet()
+        {
+            try
+            {
+                _cache = ProcCatalog.List();
+                _refreshError = null;
+                FillList(false);
+            }
+            catch (Exception ex)
+            {
+                if (_refreshError == ex.Message) return;
+                _refreshError = ex.Message;
+                Log("刷新进程失败：" + ex.Message);
+            }
+        }
+
+        void OpenWav()
+        {
+            OpenFileDialog dlg = new OpenFileDialog();
+            dlg.Filter = "WAV (*.wav)|*.wav";
+            dlg.Title = "打开要裁剪的录音";
+            try { dlg.InitialDirectory = NormalizeDir(_dirBox.Text); }
+            catch { }
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            _lastFile = dlg.FileName;
+            OpenTrim(dlg.FileName);
+        }
+
+        static string Meter(float peak)
+        {
+            if (peak < 0) peak = 0;
+            if (peak > 1) peak = 1;
+            int n = (int)(peak * 12);
+            if (peak > 0 && n == 0) n = 1;
+            return "[" + new string('#', n) + new string('-', 12 - n) + "]";
         }
 
         void OpenTrim(string path)
@@ -622,7 +721,7 @@ namespace LoopTap
             if (create)
                 Directory.CreateDirectory(dir);
             try { OutputDir.Save(dir); }
-            catch { }
+            catch (Exception ex) { Log("没能记住保存位置：" + ex.Message); }
             return dir;
         }
 
@@ -694,6 +793,15 @@ namespace LoopTap
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+
+        sealed class RowRef
+        {
+            public int Pid;
+            public long StartTicks;
+            public string Name;
+            public string Title;
+            public int WindowCount;
+        }
 
         static string Safe(string name)
         {

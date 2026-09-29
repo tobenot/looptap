@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace LoopTap
@@ -14,6 +17,88 @@ namespace LoopTap
         public string Title;
         public bool Browser;
         public bool Playing;
+        public long StartTicks;
+        public int WindowCount;
+        public List<string> Windows;
+    }
+
+    static class ScreenPlace
+    {
+        public static void CenterOnCursor(Form f)
+        {
+            Screen s = Screen.FromPoint(Cursor.Position);
+            Rectangle wa = s.WorkingArea;
+            int x = wa.Left + Math.Max(0, (wa.Width - f.Width) / 2);
+            int y = wa.Top + Math.Max(0, (wa.Height - f.Height) / 2);
+            f.StartPosition = FormStartPosition.Manual;
+            f.SetBounds(x, y, f.Width, f.Height);
+        }
+
+        public static void CenterOnOwner(Form f)
+        {
+            if (f.Owner == null)
+            {
+                CenterOnCursor(f);
+                return;
+            }
+            Rectangle wa = f.Owner.Bounds;
+            int x = wa.Left + Math.Max(0, (wa.Width - f.Width) / 2);
+            int y = wa.Top + Math.Max(0, (wa.Height - f.Height) / 2);
+            Screen s = Screen.FromControl(f.Owner);
+            if (x < s.WorkingArea.Left) x = s.WorkingArea.Left;
+            if (y < s.WorkingArea.Top) y = s.WorkingArea.Top;
+            f.StartPosition = FormStartPosition.Manual;
+            f.SetBounds(x, y, f.Width, f.Height);
+        }
+    }
+
+    static class ProcessIdentity
+    {
+        public static long ReadStartTicks(Process p)
+        {
+            try { return p.StartTime.ToUniversalTime().Ticks; }
+            catch { return 0; }
+        }
+
+        public static bool Same(string listedName, long listedTicks, string liveName, long liveTicks)
+        {
+            if (string.IsNullOrEmpty(listedName) || string.IsNullOrEmpty(liveName)) return false;
+            if (!string.Equals(listedName, liveName, StringComparison.OrdinalIgnoreCase)) return false;
+            if (listedTicks == 0 || liveTicks == 0) return true;
+            return listedTicks == liveTicks;
+        }
+
+        public static string FailureText(bool processAlive, string exceptionMessage)
+        {
+            if (!processAlive)
+                return "目标进程已退出。已经写入的部分仍是合法 WAV。";
+            string msg = exceptionMessage ?? "";
+            if (msg.IndexOf("88890004", StringComparison.Ordinal) >= 0)
+                return "播放设备失效或默认设备变了。已经写入的部分仍是合法 WAV。";
+            if (msg.Length == 0) return "录制中断。";
+            return msg;
+        }
+
+        public static void SelfCheck()
+        {
+            if (!Same("chrome", 10, "Chrome", 10))
+                throw new InvalidOperationException("同一进程被当成了另一个。");
+            if (Same("chrome", 10, "chrome", 11))
+                throw new InvalidOperationException("PID 复用没有被认出来。");
+            if (Same("chrome", 10, "firefox", 10))
+                throw new InvalidOperationException("进程名不同还当成了同一个。");
+            if (!Same("chrome", 0, "chrome", 10))
+                throw new InvalidOperationException("拿不到启动时间时不该直接判成复用。");
+            string dead = FailureText(false, "错误码 0x88890004");
+            if (dead.IndexOf("进程已退出", StringComparison.Ordinal) < 0)
+                throw new InvalidOperationException("进程退出和设备失效说成了同一件事。");
+            string device = FailureText(true, "音频设备已失效（0x88890004）。");
+            if (device.IndexOf("播放设备", StringComparison.Ordinal) < 0)
+                throw new InvalidOperationException("设备失效没有单独说明。");
+            string disk = FailureText(true, "磁盘已满，录音停在最后一个完整位置。");
+            if (disk.IndexOf("磁盘已满", StringComparison.Ordinal) < 0)
+                throw new InvalidOperationException("磁盘满的说明被盖掉了。");
+        }
     }
 
     static class OutputDir
@@ -75,6 +160,8 @@ namespace LoopTap
                     item.Pid = p.Id;
                     item.Title = "";
                     item.Browser = IsBrowser(name);
+                    item.StartTicks = ProcessIdentity.ReadStartTicks(p);
+                    item.Windows = new List<string>();
                     list.Add(item);
                 }
                 catch (InvalidOperationException) { }
@@ -85,8 +172,58 @@ namespace LoopTap
                 }
             }
             WhoPlays.Apply(list);
+            list = ExpandWindows(list);
             list.Sort(Compare);
             return list;
+        }
+
+        public static List<ProcItem> ExpandWindows(List<ProcItem> list)
+        {
+            List<ProcItem> next = new List<ProcItem>();
+            for (int i = 0; i < list.Count; i++)
+            {
+                ProcItem src = list[i];
+                int n = src.Windows == null ? 0 : src.Windows.Count;
+                if (n <= 1)
+                {
+                    src.WindowCount = n;
+                    if (n == 1) src.Title = src.Windows[0];
+                    next.Add(src);
+                    continue;
+                }
+                for (int w = 0; w < n; w++)
+                {
+                    ProcItem row = new ProcItem();
+                    row.Name = src.Name;
+                    row.Pid = src.Pid;
+                    row.Title = src.Windows[w];
+                    row.Browser = src.Browser;
+                    row.Playing = src.Playing;
+                    row.StartTicks = src.StartTicks;
+                    row.WindowCount = n;
+                    row.Windows = src.Windows;
+                    next.Add(row);
+                }
+            }
+            return next;
+        }
+
+        public static void SelfCheck()
+        {
+            ProcItem src = new ProcItem();
+            src.Name = "chrome";
+            src.Pid = 5;
+            src.StartTicks = 99;
+            src.Playing = true;
+            src.Browser = true;
+            src.Windows = new List<string>();
+            src.Windows.Add("页A");
+            src.Windows.Add("页B");
+            List<ProcItem> rows = ExpandWindows(new List<ProcItem>(new ProcItem[] { src }));
+            if (rows.Count != 2 || rows[0].Title != "页A" || rows[1].Title != "页B")
+                throw new InvalidOperationException("多窗口没有拆成两行。");
+            if (rows[1].Pid != 5 || rows[1].StartTicks != 99 || !rows[1].Playing || rows[0].WindowCount != 2)
+                throw new InvalidOperationException("拆开的窗口行丢了进程信息。");
         }
 
         public static bool IsBrowser(string name)
@@ -114,12 +251,16 @@ namespace LoopTap
             if (c != 0) return c;
             c = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
             if (c != 0) return c;
-            return a.Pid.CompareTo(b.Pid);
+            c = a.Pid.CompareTo(b.Pid);
+            if (c != 0) return c;
+            return string.Compare(a.Title, b.Title, StringComparison.Ordinal);
         }
     }
 
     static class Program
     {
+        static Mutex _single;
+
         [STAThread]
         static int Main(string[] args)
         {
@@ -138,6 +279,9 @@ namespace LoopTap
             if (args != null && args.Length == 1 && args[0] == "--selfcheck")
             {
                 WhoPlays.SelfCheck();
+                ProcCatalog.SelfCheck();
+                ProcessIdentity.SelfCheck();
+                WavWriter.SelfCheck();
                 WavCut.SelfCheck();
                 Console.WriteLine("selfcheck ok");
                 return 0;
@@ -158,6 +302,13 @@ namespace LoopTap
 
             if (args == null || args.Length == 0)
             {
+                bool createdNew;
+                _single = new Mutex(true, @"Local\LoopTap", out createdNew);
+                if (!createdNew)
+                {
+                    SignalExisting();
+                    return 0;
+                }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -202,20 +353,24 @@ namespace LoopTap
         {
             List<ProcItem> list = ProcCatalog.List();
             Console.WriteLine("内部版本=" + OsInfo.Build);
-            int playing = 0;
+            HashSet<int> pids = new HashSet<int>();
+            HashSet<int> playing = new HashSet<int>();
             int titled = 0;
             for (int i = 0; i < list.Count; i++)
             {
-                if (list[i].Playing) playing++;
+                pids.Add(list[i].Pid);
+                if (list[i].Playing) playing.Add(list[i].Pid);
                 if (list[i].Title != null && list[i].Title.Length > 0) titled++;
             }
-            Console.WriteLine("共 " + list.Count + " 个进程，有窗口 " + titled + " 个，正在出声 " + playing + " 个");
+            Console.WriteLine("共 " + pids.Count + " 个进程，有窗口 " + titled + " 个，正在出声 " + playing.Count + " 个");
             if (!string.IsNullOrEmpty(WhoPlays.LastError))
                 Console.WriteLine("出声检测失败：" + WhoPlays.LastError);
             for (int i = 0; i < list.Count; i++)
             {
                 ProcItem p = list[i];
                 string note = p.Playing ? "正在出声" : (p.Browser ? "浏览器" : "");
+                if (p.WindowCount > 1)
+                    note = note.Length == 0 ? "整进程" : note + " 整进程";
                 Console.WriteLine(p.Pid + "\t" + p.Name + "\t" + note + "\t" + p.Title);
             }
             return 0;
@@ -277,6 +432,38 @@ namespace LoopTap
             rec.Dispose();
             return code;
         }
+
+        static void SignalExisting()
+        {
+            EnumWindows(delegate(IntPtr hwnd, IntPtr lparam)
+            {
+                if (!IsWindowVisible(hwnd)) return true;
+                StringBuilder sb = new StringBuilder(256);
+                GetWindowText(hwnd, sb, sb.Capacity);
+                if (sb.ToString().IndexOf("LoopTap", StringComparison.Ordinal) < 0) return true;
+                ShowWindow(hwnd, 9);
+                SetForegroundWindow(hwnd);
+                return false;
+            }, IntPtr.Zero);
+            MessageBox.Show("LoopTap 已经在运行。", "LoopTap");
+        }
+
+        delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lparam);
+
+        [DllImport("user32.dll")]
+        static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lparam);
+
+        [DllImport("user32.dll")]
+        static extern bool IsWindowVisible(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        static extern bool SetForegroundWindow(IntPtr hwnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetWindowText(IntPtr hwnd, StringBuilder sb, int max);
+
+        [DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hwnd, int cmd);
 
         public static void Crash(Exception ex)
         {

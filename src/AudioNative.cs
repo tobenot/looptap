@@ -383,9 +383,20 @@ namespace LoopTap
     interface IMMDeviceEnumerator
     {
         [PreserveSig]
-        int EnumAudioEndpoints(int dataFlow, uint stateMask, out IntPtr devices);
+        int EnumAudioEndpoints(int dataFlow, uint stateMask, out IMMDeviceCollection devices);
         [PreserveSig]
         int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
+    }
+
+    [ComImport]
+    [Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceCollection
+    {
+        [PreserveSig]
+        int GetCount(out uint count);
+        [PreserveSig]
+        int Item(uint index, out IMMDevice device);
     }
 
     [ComImport]
