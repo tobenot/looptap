@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 
 namespace LoopTap
 {
@@ -660,10 +661,107 @@ namespace LoopTap
             return baseName + suffix + DateTime.Now.ToString("HHmmss");
         }
 
+        public static float DbToAmp(double db)
+        {
+            if (double.IsNaN(db) || double.IsInfinity(db))
+                throw new InvalidOperationException("目标电平无效。");
+            return (float)Math.Pow(10.0, db / 20.0);
+        }
+
+        public static double AmpToDb(float amp)
+        {
+            if (!(amp > 0f) || float.IsNaN(amp) || float.IsInfinity(amp))
+                return double.NegativeInfinity;
+            return 20.0 * Math.Log10(amp);
+        }
+
+        public static float GainToTarget(float peak, float targetAmp)
+        {
+            if (!(peak > 1e-12f) || float.IsNaN(peak) || float.IsInfinity(peak))
+                throw new InvalidOperationException("这段是静音，没有可放大的峰值。");
+            if (!(targetAmp > 0f) || float.IsNaN(targetAmp) || float.IsInfinity(targetAmp))
+                throw new InvalidOperationException("目标电平无效。");
+            float gain = targetAmp / peak;
+            if (!(gain > 0f) || float.IsNaN(gain) || float.IsInfinity(gain))
+                throw new InvalidOperationException("归一化增益无效。");
+            return gain;
+        }
+
+        public static float Peak(WavInfo info, long start, long end)
+        {
+            if (info == null || info.BlockAlign <= 0 || end <= start) return 0f;
+            if (start < 0) start = 0;
+            if (end > info.Frames) end = info.Frames;
+            if (end <= start) return 0f;
+            float peak = 0f;
+            int block = info.BlockAlign;
+            byte[] buf = new byte[65536 - (65536 % block)];
+            using (FileStream fs = new FileStream(info.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                fs.Position = info.DataOffset + start * block;
+                long left = (end - start) * (long)block;
+                long remain = fs.Length - fs.Position;
+                if (left > remain) left = remain;
+                while (left >= block)
+                {
+                    int want = buf.Length;
+                    if (want > left) want = (int)left;
+                    int got = 0;
+                    while (got < want)
+                    {
+                        int n = fs.Read(buf, got, want - got);
+                        if (n <= 0) break;
+                        got += n;
+                    }
+                    got -= got % block;
+                    if (got <= 0) break;
+                    int samples = got / 4;
+                    for (int i = 0; i < samples; i++)
+                    {
+                        float s = BitConverter.ToSingle(buf, i * 4);
+                        if (float.IsNaN(s) || float.IsInfinity(s)) continue;
+                        float a = s < 0f ? -s : s;
+                        if (a > peak) peak = a;
+                    }
+                    left -= got;
+                }
+            }
+            return peak;
+        }
+
+        // ponytail: 和峰值相等的采样写成正好的目标值，其余乘同一个 float。差在 1 ulp。升级：double 增益后再修一次峰值。
+        public static void ApplyGain(byte[] buf, int bytes, float gain, float peak, float target)
+        {
+            if (bytes <= 0 || gain == 1f) return;
+            bool snap = peak > 0f && !float.IsNaN(target) && !float.IsInfinity(target);
+            int n = bytes >> 2;
+            for (int i = 0; i < n; i++)
+            {
+                int o = i << 2;
+                float s = BitConverter.ToSingle(buf, o);
+                float v;
+                if (float.IsNaN(s) || float.IsInfinity(s))
+                    v = 0f;
+                else if (snap && (s == peak || s == -peak))
+                    v = s < 0f ? -target : target;
+                else
+                    v = s * gain;
+                PutSingle(buf, o, v);
+            }
+        }
+
         public static void SaveRange(WavInfo info, long start, long end, string dest)
+        {
+            SaveRange(info, start, end, dest, 1f, 0f, 0f);
+        }
+
+        public static void SaveRange(WavInfo info, long start, long end, string dest, float gain, float peak, float target)
         {
             if (start < 0 || end > info.Frames || end <= start)
                 throw new InvalidOperationException("裁剪范围无效。");
+            if (float.IsNaN(gain) || float.IsInfinity(gain) || gain <= 0f)
+                throw new InvalidOperationException("归一化增益无效。");
+            bool scale = gain != 1f;
             long frames = end - start;
             long bytes = frames * info.BlockAlign;
             byte[] header = WavWriter.Header(info.Channels, info.Rate, info.Bits, info.BlockAlign, info.ChannelMask, bytes);
@@ -673,18 +771,59 @@ namespace LoopTap
                 output.Write(header, 0, header.Length);
                 input.Position = info.DataOffset + start * info.BlockAlign;
                 long left = bytes;
-                byte[] buf = new byte[1024 * 1024];
+                int chunk = 1024 * 1024;
+                if (scale)
+                    chunk -= chunk % info.BlockAlign;
+                byte[] buf = new byte[chunk];
                 while (left > 0)
                 {
                     int want = buf.Length;
                     if (want > left) want = (int)left;
-                    int got = input.Read(buf, 0, want);
+                    int got = 0;
+                    while (got < want)
+                    {
+                        int n = input.Read(buf, got, want - got);
+                        if (n <= 0) break;
+                        got += n;
+                    }
                     if (got <= 0)
                         throw new EndOfStreamException("录音文件比预期短，没有改原文件。");
-                    output.Write(buf, 0, got);
-                    left -= got;
+                    if (scale)
+                    {
+                        int aligned = got - (got % info.BlockAlign);
+                        if (aligned <= 0)
+                            throw new EndOfStreamException("录音文件比预期短，没有改原文件。");
+                        ApplyGain(buf, aligned, gain, peak, target);
+                        output.Write(buf, 0, aligned);
+                        left -= aligned;
+                        if (aligned < got)
+                            input.Position -= (got - aligned);
+                    }
+                    else
+                    {
+                        output.Write(buf, 0, got);
+                        left -= got;
+                    }
                 }
             }
+        }
+
+        static void PutSingle(byte[] buf, int o, float v)
+        {
+            FloatBits bits = new FloatBits();
+            bits.F = v;
+            int i = bits.I;
+            buf[o] = (byte)i;
+            buf[o + 1] = (byte)(i >> 8);
+            buf[o + 2] = (byte)(i >> 16);
+            buf[o + 3] = (byte)(i >> 24);
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        struct FloatBits
+        {
+            [FieldOffset(0)] public float F;
+            [FieldOffset(0)] public int I;
         }
 
         public static void SelfCheck()
@@ -847,6 +986,65 @@ namespace LoopTap
                 LoopHit many = FindLoop(Open(loop14));
                 Check(Math.Abs(many.Period - 12000) <= 8, "十四遍周期不对：" + many.Period + " conf=" + many.Confidence);
                 Check(many.Start >= 0 && many.Start <= 8, "十四遍起点不对：" + many.Start);
+
+                string nLow = path + ".nlow";
+                string nHigh = path + ".nhigh";
+                string nZero = path + ".nzero";
+                string nLowOut = nLow + ".out";
+                string nHighOut = nHigh + ".out";
+                float[] low = new float[16];
+                for (int i = 0; i < 8; i++) low[i] = 0.02f;
+                for (int i = 8; i < 16; i++) low[i] = 0.1f;
+                low[10] = 0.04f;
+                low[11] = 0f;
+                WriteFloatWav(nLow, low, rate);
+                WavInfo lowInfo = Open(nLow);
+                float lowPeak = Peak(lowInfo, 0, lowInfo.Frames);
+                float lowHead = Peak(lowInfo, 0, 8);
+                Check(lowPeak == 0.1f, "0.1 峰值没读准：" + lowPeak);
+                Check(lowHead == 0.02f, "选区峰值串到了后面：" + lowHead);
+                float target = DbToAmp(-1.0);
+                Check(Math.Abs(target - 0.891250938f) < 1e-4f, "-1 dBFS 不是约 0.891：" + target);
+                float gLow = GainToTarget(lowPeak, target);
+                Check(gLow > 1f, "0.1 应该放大");
+                SaveRange(lowInfo, 0, lowInfo.Frames, nLowOut, gLow, lowPeak, target);
+                WavInfo lowOut = Open(nLowOut);
+                Check(lowOut.Rate == rate && lowOut.Bits == 32 && lowOut.Channels == 2, "归一化改了格式");
+                float outPeak = Peak(lowOut, 0, lowOut.Frames);
+                Check(outPeak == target, "放大后峰值不是目标：" + outPeak + " target=" + target);
+                float outBig = FrameAmp(nLowOut, 8);
+                float outMid = FrameAmp(nLowOut, 10);
+                float outZero = FrameAmp(nLowOut, 11);
+                Check(outBig == target, "峰值采样不是目标：" + outBig);
+                Check(outZero == 0f, "静音采样被放大了");
+                float ratioIn = 0.1f / 0.04f;
+                float ratioOut = outBig / outMid;
+                Check(Math.Abs(ratioOut - ratioIn) <= 1e-4f * ratioIn, "放大后波形比例变了：" + ratioIn + " -> " + ratioOut);
+
+                float[] high = new float[8];
+                for (int i = 0; i < high.Length; i++) high[i] = 0.9f;
+                high[2] = 0.3f;
+                WriteFloatWav(nHigh, high, rate);
+                WavInfo highInfo = Open(nHigh);
+                float highPeak = Peak(highInfo, 0, highInfo.Frames);
+                Check(highPeak == 0.9f, "0.9 峰值没读准：" + highPeak);
+                float gHigh = GainToTarget(highPeak, target);
+                Check(gHigh < 1f, "高于目标时应该往下收");
+                SaveRange(highInfo, 0, highInfo.Frames, nHighOut, gHigh, highPeak, target);
+                float highOutPeak = Peak(Open(nHighOut), 0, high.Length);
+                Check(highOutPeak == target, "往下收之后峰值不是目标：" + highOutPeak);
+                float highBig = FrameAmp(nHighOut, 0);
+                float highMid = FrameAmp(nHighOut, 2);
+                float ratioInH = 0.9f / 0.3f;
+                float ratioOutH = highBig / highMid;
+                Check(Math.Abs(ratioOutH - ratioInH) <= 1e-4f * ratioInH, "往下收波形比例变了：" + ratioInH + " -> " + ratioOutH);
+
+                float[] mute = new float[8];
+                WriteFloatWav(nZero, mute, rate);
+                bool refused = false;
+                try { GainToTarget(Peak(Open(nZero), 0, mute.Length), target); }
+                catch (InvalidOperationException ex) { refused = ex.Message.IndexOf("静音", StringComparison.Ordinal) >= 0; }
+                Check(refused, "全静音没有拒绝放大");
             }
             finally
             {
@@ -861,7 +1059,42 @@ namespace LoopTap
                 try { File.Delete(path + ".loopLead"); } catch { }
                 try { File.Delete(path + ".loopOnce"); } catch { }
                 try { File.Delete(path + ".loop14"); } catch { }
+                try { File.Delete(path + ".nlow"); } catch { }
+                try { File.Delete(path + ".nlow.out"); } catch { }
+                try { File.Delete(path + ".nhigh"); } catch { }
+                try { File.Delete(path + ".nhigh.out"); } catch { }
+                try { File.Delete(path + ".nzero"); } catch { }
             }
+        }
+
+        static void WriteFloatWav(string path, float[] mono, int rate)
+        {
+            int channels = 2;
+            int block = 8;
+            byte[] pcm = new byte[mono.Length * block];
+            for (int i = 0; i < mono.Length; i++)
+            {
+                byte[] sample = BitConverter.GetBytes(mono[i]);
+                Buffer.BlockCopy(sample, 0, pcm, i * block, 4);
+                Buffer.BlockCopy(sample, 0, pcm, i * block + 4, 4);
+            }
+            using (WavWriter w = new WavWriter(path, channels, rate, 32, block, 3))
+            {
+                w.Write(pcm, pcm.Length);
+                w.Finish();
+            }
+        }
+
+        static float FrameAmp(string path, int frame)
+        {
+            WavInfo info = Open(path);
+            byte[] buf = new byte[4];
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                fs.Position = info.DataOffset + (long)frame * info.BlockAlign;
+                ReadExact(fs, buf, 4);
+            }
+            return BitConverter.ToSingle(buf, 0);
         }
 
         static void WriteToneLoops(string path, int rate, int lead, int burst, int gap, int reps, int tail)

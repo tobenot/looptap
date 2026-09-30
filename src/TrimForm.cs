@@ -24,6 +24,10 @@ namespace LoopTap
         readonly TextBox _periodBox;
         readonly Label _secLabel;
         readonly CheckBox _gridOn;
+        readonly CheckBox _normOn;
+        readonly TextBox _targetBox;
+        readonly Label _dbUnit;
+        readonly Label _normInfo;
         readonly Label _loopInfo;
         readonly System.Windows.Forms.Timer _playTimer;
         readonly ManualResetEvent _playDone = new ManualResetEvent(true);
@@ -44,7 +48,12 @@ namespace LoopTap
         int _loopGen;
         bool _loopBusy;
         bool _suppress;
+        bool _normSuppress;
         bool _usedLoop;
+        float _selPeak = -1f;
+        int _peakGen;
+        int _peakWait;
+        double _targetDb = -1.0;
 
         public TrimForm(string path)
         {
@@ -53,8 +62,8 @@ namespace LoopTap
             StartPosition = FormStartPosition.Manual;
             AutoScaleMode = AutoScaleMode.Dpi;
             Width = 900;
-            Height = 520;
-            MinimumSize = new Size(720, 380);
+            Height = 560;
+            MinimumSize = new Size(720, 420);
             DoubleBuffered = true;
             try { Font = new Font("Microsoft YaHei UI", 9f); }
             catch { }
@@ -142,6 +151,46 @@ namespace LoopTap
                 PushLoop();
             };
 
+            _normOn = new CheckBox();
+            _normOn.Text = "如果不满意音量，试试归一化";
+            _normOn.AutoSize = true;
+            _normOn.Left = 8;
+            _normOn.Top = 82;
+            _normOn.CheckedChanged += delegate
+            {
+                if (_normSuppress) return;
+                UpdateNormText();
+                UpdateText();
+            };
+
+            _targetBox = new TextBox();
+            _targetBox.Left = 250;
+            _targetBox.Top = 80;
+            _targetBox.Width = 64;
+            _targetBox.Height = 22;
+            _targetBox.Text = "-1.00";
+            _targetBox.KeyDown += delegate(object s, KeyEventArgs ev)
+            {
+                if (ev.KeyCode != Keys.Enter) return;
+                ev.SuppressKeyPress = true;
+                ApplyTargetText();
+            };
+            _targetBox.Leave += delegate { ApplyTargetText(); };
+
+            _dbUnit = new Label();
+            _dbUnit.AutoSize = true;
+            _dbUnit.Text = "dBFS";
+            _dbUnit.Left = 318;
+            _dbUnit.Top = 84;
+
+            _normInfo = new Label();
+            _normInfo.AutoSize = false;
+            _normInfo.AutoEllipsis = true;
+            _normInfo.Left = 360;
+            _normInfo.Top = 82;
+            _normInfo.Height = 22;
+            _normInfo.Text = "";
+
             _loopInfo = new Label();
             _loopInfo.AutoSize = false;
             _loopInfo.AutoEllipsis = true;
@@ -152,19 +201,19 @@ namespace LoopTap
             _hint = new Label();
             _hint.AutoSize = false;
             _hint.Left = 8;
-            _hint.Top = 80;
+            _hint.Top = 116;
             _hint.Height = 36;
             _hint.Text = "正在看波形……";
 
             _detail = new Label();
             _detail.AutoSize = false;
             _detail.Left = 8;
-            _detail.Top = 118;
+            _detail.Top = 154;
             _detail.Height = 64;
             _detail.Text = "";
 
             _bar = new Panel();
-            _bar.Height = 196;
+            _bar.Height = 230;
             _bar.Controls.Add(_play);
             _bar.Controls.Add(_align);
             _bar.Controls.Add(_save);
@@ -174,6 +223,10 @@ namespace LoopTap
             _bar.Controls.Add(_secLabel);
             _bar.Controls.Add(_oneLoop);
             _bar.Controls.Add(_gridOn);
+            _bar.Controls.Add(_normOn);
+            _bar.Controls.Add(_targetBox);
+            _bar.Controls.Add(_dbUnit);
+            _bar.Controls.Add(_normInfo);
             _bar.Controls.Add(_loopInfo);
             _bar.Controls.Add(_hint);
             _bar.Controls.Add(_detail);
@@ -190,6 +243,8 @@ namespace LoopTap
             _playTimer.Interval = 50;
             _playTimer.Tick += delegate
             {
+                if (_peakWait > 0 && --_peakWait == 0)
+                    StartPeak();
                 long frame = Interlocked.Read(ref _playFrame);
                 if (!_playing && frame < 0) return;
                 _wave.Playhead = frame;
@@ -243,6 +298,11 @@ namespace LoopTap
             _gridOn.Checked = false;
             _suppress = false;
             _loopInfo.Text = "";
+            _selPeak = -1f;
+            _peakGen++;
+            _peakWait = 0;
+            _normInfo.Text = "正在看选区峰值……";
+            _wave.DrawGain = 1f;
             _findLoop.Enabled = true;
             _oneLoop.Enabled = false;
             _wave.SetLoop(0, 0, false);
@@ -265,6 +325,7 @@ namespace LoopTap
         {
             _playing = false;
             _scanGen++;
+            _peakGen++;
             base.OnFormClosing(e);
         }
 
@@ -301,6 +362,16 @@ namespace LoopTap
             _oneLoop.Left = _secLabel.Right + 8;
             _gridOn.Left = _oneLoop.Right + 8;
             _loopInfo.Left = _gridOn.Right + 8;
+            _normOn.Top = 82;
+            _targetBox.Left = _normOn.Right + 8;
+            _targetBox.Top = 80;
+            _dbUnit.Left = _targetBox.Right + 4;
+            _dbUnit.Top = 84;
+            _normInfo.Left = _dbUnit.Right + 8;
+            _normInfo.Top = 82;
+            int normW = w - _normInfo.Left - 8;
+            if (normW < 40) normW = 40;
+            _normInfo.Width = normW;
             int infoW = w - _loopInfo.Left - 8;
             if (infoW < 40) infoW = 40;
             _loopInfo.Width = infoW;
@@ -347,6 +418,7 @@ namespace LoopTap
                             _end = info.Frames;
                         }
                         _wave.ShowScan(scan.Min, scan.Max, info.Frames, _start, _end);
+                        SchedulePeak();
                         if (!_saving)
                         {
                             _play.Enabled = true;
@@ -368,6 +440,7 @@ namespace LoopTap
             _justSaved = false;
             _start = _wave.StartFrame;
             _end = _wave.EndFrame;
+            SchedulePeak();
             UpdateText();
         }
 
@@ -555,9 +628,15 @@ namespace LoopTap
                 size = " 文件 " + RecordingName.FormatSize(new FileInfo(_info.Path).Length) + "。";
             }
             catch { }
+            string how = "原样拷贝";
+            if (_normOn.Checked && _selPeak > 1e-12f)
+            {
+                float gain = WavCut.DbToAmp(_targetDb) / _selPeak;
+                if (gain != 1f) how = "按峰值乘一个常数";
+            }
             _detail.Text = prefix + string.Format(
-                "开头去掉 {0}，结尾去掉 {1}，留下 {2}（{3} 个采样点，原样拷贝）。",
-                Clock(lead), Clock(tailSec), Clock(keep), _end - _start) + size;
+                "开头去掉 {0}，结尾去掉 {1}，留下 {2}（{3} 个采样点，{4}）。",
+                Clock(lead), Clock(tailSec), Clock(keep), _end - _start, how) + size;
         }
 
         void TogglePlay()
@@ -568,6 +647,9 @@ namespace LoopTap
                 return;
             }
             if (_info == null || _end <= _start) return;
+            float peak;
+            float target;
+            float gain = PreviewGain(out peak, out target);
             _playDone.Reset();
             _playing = true;
             Interlocked.Exchange(ref _playFrame, _start);
@@ -575,18 +657,21 @@ namespace LoopTap
             WavInfo info = _info;
             long a = _start;
             long b = _end;
-            Thread t = new Thread(new ThreadStart(delegate { PlayBody(info, a, b); }));
+            float playGain = gain;
+            float playPeak = peak;
+            float playTarget = target;
+            Thread t = new Thread(new ThreadStart(delegate { PlayBody(info, a, b, playGain, playPeak, playTarget); }));
             t.IsBackground = true;
             t.SetApartmentState(ApartmentState.MTA);
             t.Start();
         }
 
-        void PlayBody(WavInfo info, long a, long b)
+        void PlayBody(WavInfo info, long a, long b, float gain, float peak, float target)
         {
             string err = null;
             try
             {
-                WavPreview.Run(info, a, b, delegate { return _playing; }, delegate(long frame) { Interlocked.Exchange(ref _playFrame, frame); });
+                WavPreview.Run(info, a, b, gain, peak, target, delegate { return _playing; }, delegate(long frame) { Interlocked.Exchange(ref _playFrame, frame); });
             }
             catch (Exception ex)
             {
@@ -614,14 +699,50 @@ namespace LoopTap
         void SaveCut(bool replaceOriginal)
         {
             if (_saving || _info == null) return;
-            if (_start <= 0 && _end >= _info.Frames)
-            {
-                MessageBox.Show(this, "选区已经是整段，没有要裁掉的部分。", "LoopTap");
-                return;
-            }
             if (_end <= _start)
             {
                 MessageBox.Show(this, "选区是空的。", "LoopTap");
+                return;
+            }
+            bool norm = _normOn.Checked;
+            float gain = 1f;
+            float peak = 0f;
+            float targetAmp = 0f;
+            bool full = _start <= 0 && _end >= _info.Frames;
+            if (norm)
+            {
+                if (!ApplyTargetText())
+                {
+                    MessageBox.Show(this, "目标峰值请填 dBFS，例如 -1.00。", "LoopTap");
+                    return;
+                }
+                UseWaitCursor = true;
+                try { peak = WavCut.Peak(_info, _start, _end); }
+                catch (Exception ex)
+                {
+                    UseWaitCursor = false;
+                    MessageBox.Show(this, "看峰值失败：" + ex.Message, "LoopTap");
+                    return;
+                }
+                UseWaitCursor = false;
+                _selPeak = peak;
+                UpdateNormText();
+                try
+                {
+                    targetAmp = WavCut.DbToAmp(_targetDb);
+                    gain = WavCut.GainToTarget(peak, targetAmp);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, ex.Message, "LoopTap");
+                    return;
+                }
+            }
+            if (full && gain == 1f)
+            {
+                MessageBox.Show(this, norm
+                    ? "选区已经是整段，峰值也已经在目标电平。"
+                    : "选区已经是整段，没有要裁掉的部分。", "LoopTap");
                 return;
             }
             double lead = _start / (double)_info.Rate;
@@ -629,12 +750,28 @@ namespace LoopTap
             string path = _info.Path;
             string dest = path;
             string backup = null;
+            string volLine = "";
+            if (norm && gain != 1f)
+            {
+                volLine = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "\r\n音量按峰值归一化到 {0:0.00} dBFS（现在 {1:0.0} dBFS，增益 {2:+0.0;-0.0;0} dB）。每个采样点乘同一个常数，不重采样。",
+                    _targetDb, WavCut.AmpToDb(peak), _targetDb - WavCut.AmpToDb(peak));
+            }
             if (replaceOriginal)
             {
                 backup = WavCut.ChooseBackup(path, delegate(string candidate) { return File.Exists(candidate); });
-                string msg = string.Format(
-                    "开头去掉 {0}，结尾去掉 {1}。\r\n留下的采样点原样拷贝，不改采样率和位深。\r\n这条录音会换成裁剪结果。完整原件留在：\r\n{2}",
-                    Clock(lead), Clock(tailSec), backup);
+                string msg;
+                if (full)
+                    msg = "不会裁掉采样点。" + volLine + "\r\n这条录音会换成归一化结果。完整原件留在：\r\n" + backup;
+                else if (gain == 1f)
+                    msg = string.Format(
+                        "开头去掉 {0}，结尾去掉 {1}。\r\n留下的采样点原样拷贝，不改采样率和位深。\r\n这条录音会换成裁剪结果。完整原件留在：\r\n{2}",
+                        Clock(lead), Clock(tailSec), backup);
+                else
+                    msg = string.Format(
+                        "开头去掉 {0}，结尾去掉 {1}。{2}\r\n不改采样率和位深。\r\n这条录音会换成裁剪结果。完整原件留在：\r\n{3}",
+                        Clock(lead), Clock(tailSec), volLine, backup);
                 if (MessageBox.Show(this, msg, "LoopTap", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
                     return;
             }
@@ -647,7 +784,7 @@ namespace LoopTap
                 try { dlg.InitialDirectory = Path.GetDirectoryName(path); }
                 catch { }
                 string baseName = Path.GetFileNameWithoutExtension(path);
-                string suffix = _usedLoop ? "_循环一遍" : "_裁剪";
+                string suffix = _usedLoop ? "_循环一遍" : (gain != 1f && full ? "_归一化" : "_裁剪");
                 dlg.FileName = WavCut.ChooseFree(Path.GetDirectoryName(path), baseName, suffix, ".wav");
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
                 dest = dlg.FileName;
@@ -671,12 +808,17 @@ namespace LoopTap
             _play.Enabled = false;
             _findLoop.Enabled = false;
             _oneLoop.Enabled = false;
+            _normOn.Enabled = false;
+            _targetBox.Enabled = false;
             WavInfo info = _info;
             long a = _start;
             long b = _end;
             string finalDest = dest;
             string bak = backup;
             bool replace = replaceOriginal;
+            float saveGain = gain;
+            float savePeak = peak;
+            float saveTarget = targetAmp;
             Thread t = new Thread(new ThreadStart(delegate
             {
                 string err = null;
@@ -688,7 +830,7 @@ namespace LoopTap
                         string tmp = path + ".part";
                         try
                         {
-                            WavCut.SaveRange(info, a, b, tmp);
+                            WavCut.SaveRange(info, a, b, tmp, saveGain, savePeak, saveTarget);
                             File.Replace(tmp, path, bak);
                         }
                         catch
@@ -700,7 +842,7 @@ namespace LoopTap
                     }
                     else
                     {
-                        WavCut.SaveRange(info, a, b, finalDest);
+                        WavCut.SaveRange(info, a, b, finalDest, saveGain, savePeak, saveTarget);
                     }
                 }
                 catch (Exception ex)
@@ -712,6 +854,8 @@ namespace LoopTap
                 string note = replace
                     ? "已保存。完整原件留在 " + Path.GetFileName(bak) + "。"
                     : "已另存，原来的录音没动。";
+                if (saveGain != 1f)
+                    note = "音量已归一化。" + note;
                 try
                 {
                     BeginInvoke(new Action(delegate
@@ -725,10 +869,14 @@ namespace LoopTap
                             _saveAs.Enabled = true;
                             _findLoop.Enabled = true;
                             _oneLoop.Enabled = _periodFrames > 1;
+                            _normOn.Enabled = true;
+                            _targetBox.Enabled = true;
                             MessageBox.Show(this, "保存失败：" + error + "\r\n原文件还在。", "LoopTap");
                             return;
                         }
                         _savedExtra = note;
+                        _normOn.Enabled = true;
+                        _targetBox.Enabled = true;
                         try { LoadCore(openPath, true); }
                         catch (Exception ex)
                         {
@@ -736,6 +884,8 @@ namespace LoopTap
                             _save.Enabled = true;
                             _saveAs.Enabled = true;
                             _findLoop.Enabled = true;
+                            _normOn.Enabled = true;
+                            _targetBox.Enabled = true;
                             MessageBox.Show(this, "已经保存，但重新打开失败：" + ex.Message, "LoopTap");
                         }
                     }));
@@ -744,6 +894,131 @@ namespace LoopTap
             }));
             t.IsBackground = false;
             t.Start();
+        }
+
+        void SchedulePeak()
+        {
+            if (_info == null || _end <= _start) return;
+            _peakWait = 4;
+        }
+
+        void StartPeak()
+        {
+            if (_info == null || _end <= _start) return;
+            int gen = ++_peakGen;
+            WavInfo info = _info;
+            long a = _start;
+            long b = _end;
+            Thread t = new Thread(new ThreadStart(delegate
+            {
+                float peak = 0f;
+                Exception err = null;
+                try { peak = WavCut.Peak(info, a, b); }
+                catch (Exception ex) { err = ex; }
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (IsDisposed || gen != _peakGen) return;
+                        if (err != null)
+                        {
+                            _selPeak = -1f;
+                            _normInfo.Text = "看峰值失败：" + err.Message;
+                            _wave.DrawGain = 1f;
+                            return;
+                        }
+                        _selPeak = peak;
+                        UpdateNormText();
+                        UpdateText();
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            }));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        bool ApplyTargetText()
+        {
+            if (_normSuppress) return true;
+            string text = _targetBox.Text == null ? "" : _targetBox.Text.Trim().Replace('，', '.').Replace(',', '.');
+            double db;
+            if (text.Length == 0 || !double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out db)
+                || double.IsNaN(db) || double.IsInfinity(db))
+            {
+                _normInfo.Text = "目标峰值请填 dBFS，例如 -1.00。";
+                return false;
+            }
+            // ponytail: 目标夹在 -60 到 +12 dBFS。再往上试听会在设备里削波。升级：去掉上限。
+            if (db < -60) db = -60;
+            if (db > 12) db = 12;
+            _targetDb = db;
+            _normSuppress = true;
+            _targetBox.Text = db.ToString("0.00", CultureInfo.InvariantCulture);
+            _normSuppress = false;
+            UpdateNormText();
+            return true;
+        }
+
+        void UpdateNormText()
+        {
+            if (_normInfo == null) return;
+            if (_selPeak < 0f)
+            {
+                _normInfo.Text = "正在看选区峰值……";
+                _wave.DrawGain = 1f;
+                return;
+            }
+            if (!(_selPeak > 1e-12f))
+            {
+                _normInfo.Text = _normOn.Checked ? "这段是静音，归一化不会放大。" : "选区是静音。";
+                _wave.DrawGain = 1f;
+                _wave.Invalidate();
+                return;
+            }
+            double now = WavCut.AmpToDb(_selPeak);
+            if (!_normOn.Checked)
+            {
+                _normInfo.Text = "选区峰值 " + now.ToString("0.0", CultureInfo.InvariantCulture) + " dBFS。";
+                _wave.DrawGain = 1f;
+                _wave.Invalidate();
+                return;
+            }
+            float target = WavCut.DbToAmp(_targetDb);
+            float draw = target / _selPeak;
+            if (!(draw > 0f) || float.IsNaN(draw) || float.IsInfinity(draw)) draw = 1f;
+            _wave.DrawGain = draw;
+            double gainDb = _targetDb - now;
+            _normInfo.Text = string.Format(
+                CultureInfo.InvariantCulture,
+                "峰值 {0:0.0} dB → {1:0.00} dB，增益 {2:+0.0;-0.0;0} dB。",
+                now, _targetDb, gainDb);
+            _wave.Invalidate();
+        }
+
+        float PreviewGain(out float peak, out float target)
+        {
+            peak = 0f;
+            target = 0f;
+            if (!_normOn.Checked || _info == null) return 1f;
+            if (_selPeak < 0f)
+            {
+                try { _selPeak = WavCut.Peak(_info, _start, _end); }
+                catch { _selPeak = 0f; }
+                UpdateNormText();
+            }
+            if (!(_selPeak > 1e-12f)) return 1f;
+            try
+            {
+                target = WavCut.DbToAmp(_targetDb);
+                float gain = WavCut.GainToTarget(_selPeak, target);
+                peak = _selPeak;
+                return gain;
+            }
+            catch
+            {
+                return 1f;
+            }
         }
 
         static string Clock(double sec)
@@ -778,6 +1053,7 @@ namespace LoopTap
             long _gridK;
             long _grabFrame;
             long _grabPhase;
+            public float DrawGain = 1f;
 
             public event EventHandler RangeChanged;
             public event EventHandler LoopChanged;
@@ -843,12 +1119,20 @@ namespace LoopTap
                     using (Pen wave = new Pen(UiTheme.Wave))
                     {
                         int n = _min.Length;
+                        float draw = DrawGain;
+                        if (!(draw > 0f) || float.IsNaN(draw) || float.IsInfinity(draw)) draw = 1f;
                         for (int x = 0; x < w; x++)
                         {
                             int col = x * n / w;
                             if (col >= n) col = n - 1;
-                            int y1 = mid - (int)(_max[col] * amp);
-                            int y2 = mid - (int)(_min[col] * amp);
+                            float hi = _max[col] * draw;
+                            float lo = _min[col] * draw;
+                            if (hi > 1f) hi = 1f;
+                            if (hi < -1f) hi = -1f;
+                            if (lo > 1f) lo = 1f;
+                            if (lo < -1f) lo = -1f;
+                            int y1 = mid - (int)(hi * amp);
+                            int y2 = mid - (int)(lo * amp);
                             if (y2 < y1)
                             {
                                 int t = y1;
@@ -1143,7 +1427,7 @@ namespace LoopTap
 
     static class WavPreview
     {
-        public static void Run(WavInfo info, long startFrame, long endFrame, Func<bool> keepGoing, Action<long> onFrame)
+        public static void Run(WavInfo info, long startFrame, long endFrame, float gain, float peak, float target, Func<bool> keepGoing, Action<long> onFrame)
         {
             if (endFrame <= startFrame) return;
             IMMDeviceEnumerator enumerator = null;
@@ -1240,6 +1524,8 @@ namespace LoopTap
                                 got += n;
                             }
                             for (int i = got; i < bytes; i++) chunk[i] = 0;
+                            if (gain != 1f)
+                                WavCut.ApplyGain(chunk, bytes, gain, peak, target);
                             Marshal.Copy(chunk, 0, dst, bytes);
                             hr = render.ReleaseBuffer(avail, 0);
                             released = true;

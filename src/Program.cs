@@ -606,6 +606,8 @@ namespace LoopTap
                     return ListCmd();
                 if (args[0] == "--record")
                     return RecordCmd(args);
+                if (args[0] == "--normalize")
+                    return NormalizeCmd(args);
             }
             catch (Exception ex)
             {
@@ -620,8 +622,49 @@ namespace LoopTap
             Console.WriteLine("  LoopTap.exe --selfcheck             检查出声归因和裁剪");
             Console.WriteLine("  LoopTap.exe --trim <wav路径>        打开裁剪窗口");
             Console.WriteLine("  LoopTap.exe --loop <wav路径>        打印循环周期");
+            Console.WriteLine("  LoopTap.exe --normalize <wav路径> <dBFS> <输出wav>");
             Console.WriteLine("  LoopTap.exe --record <pid> <秒> <wav路径>");
             return 1;
+        }
+
+        static int NormalizeCmd(string[] args)
+        {
+            if (args.Length != 4)
+            {
+                Console.Error.WriteLine("用法：LoopTap.exe --normalize <wav路径> <dBFS> <输出wav>");
+                return 1;
+            }
+            if (!File.Exists(args[1]))
+            {
+                Console.Error.WriteLine("找不到录音：" + args[1]);
+                return 1;
+            }
+            double db;
+            if (!double.TryParse(args[2], NumberStyles.Float, CultureInfo.InvariantCulture, out db))
+            {
+                Console.Error.WriteLine("目标峰值请填 dBFS，例如 -1.00。");
+                return 1;
+            }
+            string dest = Path.GetFullPath(args[3]);
+            if (string.Equals(dest, Path.GetFullPath(args[1]), StringComparison.OrdinalIgnoreCase))
+            {
+                Console.Error.WriteLine("输出请换一个文件名。");
+                return 1;
+            }
+            WavInfo info = WavCut.Open(args[1]);
+            float peak = WavCut.Peak(info, 0, info.Frames);
+            float target = WavCut.DbToAmp(db);
+            float gain = WavCut.GainToTarget(peak, target);
+            WavCut.SaveRange(info, 0, info.Frames, dest, gain, peak, target);
+            WavInfo again = WavCut.Open(dest);
+            float outPeak = WavCut.Peak(again, 0, again.Frames);
+            Console.WriteLine("peak=" + peak.ToString("0.000000", CultureInfo.InvariantCulture));
+            Console.WriteLine("target=" + target.ToString("0.000000", CultureInfo.InvariantCulture));
+            Console.WriteLine("gain=" + gain.ToString("0.0000", CultureInfo.InvariantCulture));
+            Console.WriteLine("out=" + outPeak.ToString("0.000000", CultureInfo.InvariantCulture));
+            Console.WriteLine("db=" + WavCut.AmpToDb(peak).ToString("0.00", CultureInfo.InvariantCulture)
+                + " -> " + db.ToString("0.00", CultureInfo.InvariantCulture));
+            return 0;
         }
 
         static int LoopCmd(string path)
