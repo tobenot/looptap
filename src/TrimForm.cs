@@ -556,10 +556,22 @@ namespace LoopTap
                 _loopInfo.Text = "这个周期不短于整段。";
                 return;
             }
-            long s = _phaseFrames % _periodFrames;
-            if (s < 0) s += _periodFrames;
+            // 相位（金线）在第一遍内的偏移
+            long phase = _phaseFrames % _periodFrames;
+            if (phase < 0) phase += _periodFrames;
+            long reps = _info.Frames / _periodFrames;  // 完整遍数
+
+            // 锁定最干净的一遍：>=3 遍锁中间（首遍常有起播抖动，末遍可能被截断）；
+            // 2 遍锁后一遍（避开首遍起播抖动）；1 遍锁唯一那一遍。
+            long pick;
+            if (reps >= 3) pick = reps / 2;
+            else if (reps == 2) pick = 1;
+            else pick = 0;
+
+            long s = phase + pick * _periodFrames;
             if (s + _periodFrames > _info.Frames)
-                s = 0;
+                s = _info.Frames - _periodFrames;
+            if (s < 0) s = 0;
             long e = s + _periodFrames;
             if (e > _info.Frames) e = _info.Frames;
             if (e <= s) return;
@@ -571,7 +583,15 @@ namespace LoopTap
             _wave.SetRange(_start, _end);
             PushLoop();
             UpdateText();
-            _loopInfo.Text = "选区已收到一个周期。金线是这一遍的起点。";
+            if (reps >= 3)
+                _loopInfo.Text = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "选区已锁定第 {0} 遍（共 {1} 遍）。中间的最干净，金线是这一遍的起点。",
+                    pick + 1, reps);
+            else if (reps == 2)
+                _loopInfo.Text = "选区已锁定第 2 遍。首遍可能有起播抖动，第 2 遍最干净。";
+            else
+                _loopInfo.Text = "选区已锁定这一遍。金线是这一遍的起点。";
         }
 
         void OnLoopDragged()
