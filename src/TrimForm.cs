@@ -645,7 +645,7 @@ namespace LoopTap
             string size = "";
             try
             {
-                size = " 文件 " + RecordingName.FormatSize(new FileInfo(_info.Path).Length) + "。";
+                size = " 文件\u00A0" + RecordingName.FormatSize(new FileInfo(_info.Path).Length).Replace(" ", "\u00A0") + "。";
             }
             catch { }
             string how = "原样拷贝";
@@ -1079,8 +1079,10 @@ namespace LoopTap
             long _grabFrame;
             long _grabPhase;
             public float DrawGain = 1f;
-            const int HandleGrab = 10;
+            const int PlotMargin = 8;
+            const int HandleGrab = 12;
             const int HandleCap = 14;
+            const int HandleCapW = 10;
 
             public event EventHandler RangeChanged;
             public event EventHandler LoopChanged;
@@ -1132,6 +1134,8 @@ namespace LoopTap
                 int h = ClientSize.Height;
                 g.Clear(BackColor);
                 if (w <= 1 || h <= 1) return;
+                int plotL = PlotLeft(w);
+                int plotR = PlotRight(w);
                 int xs = XAt(_start);
                 int xe = XAt(_end);
                 if (xe < xs) xe = xs;
@@ -1148,10 +1152,13 @@ namespace LoopTap
                         int n = _min.Length;
                         float draw = DrawGain;
                         if (!(draw > 0f) || float.IsNaN(draw) || float.IsInfinity(draw)) draw = 1f;
-                        for (int x = 0; x < w; x++)
+                        int span = plotR - plotL;
+                        if (span < 1) span = 1;
+                        for (int x = plotL; x <= plotR; x++)
                         {
-                            int col = x * n / w;
+                            int col = (x - plotL) * n / span;
                             if (col >= n) col = n - 1;
+                            if (col < 0) col = 0;
                             float hi = _max[col] * draw;
                             float lo = _min[col] * draw;
                             if (hi > 1f) hi = 1f;
@@ -1174,8 +1181,8 @@ namespace LoopTap
 
                 using (Brush dim = new SolidBrush(UiTheme.Dim))
                 {
-                    if (xs > 0) g.FillRectangle(dim, 0, 0, xs, h);
-                    if (xe < w) g.FillRectangle(dim, xe, 0, w - xe, h);
+                    if (xs > plotL) g.FillRectangle(dim, plotL, 0, xs - plotL, h);
+                    if (xe < plotR) g.FillRectangle(dim, xe, 0, plotR - xe + 1, h);
                 }
                 int hs = ShownX(_start);
                 int he = ShownX(_end);
@@ -1190,8 +1197,9 @@ namespace LoopTap
                 if (_play >= 0 && _frames > 0)
                 {
                     int xp = XAt(_play);
+                    if (xp < 0) xp = 0;
                     if (xp > w - 1) xp = w - 1;
-                    using (Pen head = new Pen(UiTheme.Text, 1f))
+                    using (Pen head = new Pen(UiTheme.Playhead, 1f))
                         g.DrawLine(head, xp, 0, xp, h - 1);
                 }
             }
@@ -1201,10 +1209,11 @@ namespace LoopTap
                 base.OnMouseDown(e);
                 if (e.Button != MouseButtons.Left || _frames <= 0) return;
                 Focus();
+                int panelW = ClientSize.Width;
                 int xs = ShownX(_start);
                 int xe = ShownX(_end);
-                bool nearS = Math.Abs(e.X - xs) <= HandleGrab;
-                bool nearE = Math.Abs(e.X - xe) <= HandleGrab;
+                bool nearS = NearHandle(e.X, xs, panelW, HandleGrab);
+                bool nearE = NearHandle(e.X, xe, panelW, HandleGrab);
                 long gk;
                 bool onGrid = HitGrid(e.X, out gk);
                 bool shift = (Control.ModifierKeys & Keys.Shift) == Keys.Shift;
@@ -1285,9 +1294,10 @@ namespace LoopTap
                     DragGrid(e.X);
                     return;
                 }
+                int panelW = ClientSize.Width;
                 int xs = ShownX(_start);
                 int xe = ShownX(_end);
-                if (Math.Abs(e.X - xs) <= HandleGrab || Math.Abs(e.X - xe) <= HandleGrab)
+                if (NearHandle(e.X, xs, panelW, HandleGrab) || NearHandle(e.X, xe, panelW, HandleGrab))
                     Cursor = Cursors.SizeWE;
                 else
                 {
@@ -1348,12 +1358,41 @@ namespace LoopTap
                 return ShownX(frame, _frames, ClientSize.Width);
             }
 
+            static int PlotMarginOf(int width)
+            {
+                if (width <= 1) return 0;
+                int m = PlotMargin;
+                int half = HandleCapW / 2;
+                if (m < half) m = half;
+                if (m * 2 >= width) m = (width - 1) / 2;
+                if (m < 0) m = 0;
+                return m;
+            }
+
+            static int PlotLeft(int width)
+            {
+                return PlotMarginOf(width);
+            }
+
+            static int PlotRight(int width)
+            {
+                int left = PlotMarginOf(width);
+                int right = width - left;
+                if (right < left) right = left;
+                if (width > 0 && right > width - 1) right = width - 1;
+                return right;
+            }
+
             static int MapX(long frame, long frames, int width)
             {
-                if (frames <= 0 || width <= 0) return 0;
-                if (frame <= 0) return 0;
-                if (frame >= frames) return width;
-                return (int)(frame * width / frames);
+                int left = PlotLeft(width);
+                int right = PlotRight(width);
+                if (frames <= 0 || width <= 0) return left;
+                if (frame <= 0) return left;
+                if (frame >= frames) return right;
+                int span = right - left;
+                if (span <= 0) return left;
+                return left + (int)(frame * span / frames);
             }
 
             static int ShownX(long frame, long frames, int width)
@@ -1367,10 +1406,43 @@ namespace LoopTap
 
             static long MapFrame(int x, long frames, int width)
             {
+                int left = PlotLeft(width);
+                int right = PlotRight(width);
                 if (frames <= 0 || width <= 1) return 0;
-                if (x < 0) x = 0;
-                if (x >= width) return frames;
-                return (long)x * frames / width;
+                if (x <= left) return 0;
+                if (x >= right) return frames;
+                int span = right - left;
+                if (span <= 0) return 0;
+                return (long)(x - left) * frames / span;
+            }
+
+            static bool NearHandle(int mouseX, int handleX, int width, int grab)
+            {
+                if (width <= 1) return false;
+                if (mouseX < 0) mouseX = 0;
+                if (mouseX >= width) mouseX = width - 1;
+                int lo = handleX - grab;
+                int hi = handleX + grab;
+                if (handleX <= grab) lo = 0;
+                if (handleX >= width - 1 - grab) hi = width - 1;
+                if (lo < 0) lo = 0;
+                if (hi > width - 1) hi = width - 1;
+                return mouseX >= lo && mouseX <= hi;
+            }
+
+            static void SpanAbout(int center, int half, int width, out int left, out int right)
+            {
+                left = center - half;
+                right = center + half;
+                if (width <= 0)
+                {
+                    left = 0;
+                    right = 0;
+                    return;
+                }
+                if (left < 0) left = 0;
+                if (right > width) right = width;
+                if (right < left) right = left;
             }
 
             static long DragEdge(long edge, long grabFrame, long pointerFrame)
@@ -1393,45 +1465,81 @@ namespace LoopTap
             void DrawHandleLine(Graphics g, Brush brush, int x, int w, int h)
             {
                 if (w <= 1 || h <= 1) return;
-                if (x < 0) x = 0;
-                if (x > w - 1) x = w - 1;
-                int left = x > w - 2 ? w - 2 : x;
-                if (left < 0) left = 0;
-                int lw = left + 2 > w ? w - left : 2;
-                g.FillRectangle(brush, left, 0, lw, h);
+                int left, right;
+                SpanAbout(x, 1, w, out left, out right);
+                int lw = right - left;
+                if (lw > 0) g.FillRectangle(brush, left, 0, lw, h);
             }
 
             void DrawHandleCap(Graphics g, Brush brush, int x, int w, int h)
             {
                 if (w <= 1 || h <= 1) return;
-                if (x < 0) x = 0;
-                if (x > w - 1) x = w - 1;
-                int capW = 10;
+                int left, right;
+                SpanAbout(x, HandleCapW / 2, w, out left, out right);
                 int capH = HandleCap;
                 if (capH > h) capH = h;
-                int cap = x - capW / 2;
-                if (cap + capW > w) cap = w - capW;
-                if (cap < 0) cap = 0;
-                if (cap + capW > w) capW = w - cap;
-                if (capW > 0 && capH > 0)
-                    g.FillRectangle(brush, cap, 0, capW, capH);
+                int lw = right - left;
+                if (lw > 0 && capH > 0)
+                    g.FillRectangle(brush, left, 0, lw, capH);
             }
 
             public static void SelfCheck()
             {
                 long frames = 5760000;
                 int width = 800;
+                int margin = PlotMarginOf(width);
+                int endX = MapX(frames, frames, width);
+                if (endX != width - margin)
+                    throw new InvalidOperationException("文件末尾的把手没有落在内边距上。");
+                if (MapX(0, frames, width) != margin)
+                    throw new InvalidOperationException("文件开头没有留出内边距。");
                 int shown = ShownX(frames, frames, width);
-                if (shown != width - 1)
-                    throw new InvalidOperationException("文件末尾的手柄没有落在最后一像素。");
-                long under = MapFrame(shown, frames, width);
-                if (under >= frames)
-                    throw new InvalidOperationException("最后一像素不该被当成文件末尾之后。");
-                if (DragEdge(frames, under, under) != frames)
+                if (shown != endX)
+                    throw new InvalidOperationException("末尾手柄和坐标映射不一致。");
+                long back = MapFrame(shown, frames, width);
+                if (back != frames)
+                    throw new InvalidOperationException("末尾把手往返没有回到文件末尾。");
+                if (Math.Abs(MapFrame(MapX(frames / 2, frames, width), frames, width) - frames / 2) > frames / (width - margin * 2) + 1)
+                    throw new InvalidOperationException("中点往返偏出了一整列像素。");
+                if (DragEdge(frames, back, back) != frames)
                     throw new InvalidOperationException("按住末尾手柄却把选区缩短了。");
-                long moved = DragEdge(frames, under, MapFrame(shown - 1, frames, width));
+                long moved = DragEdge(frames, back, MapFrame(shown - 1, frames, width));
                 if (moved >= frames || moved <= frames / 2)
                     throw new InvalidOperationException("拖动手柄没有跟着鼠标缩短。");
+                long small = 100;
+                for (long f = 0; f <= small; f++)
+                {
+                    long got = MapFrame(MapX(f, small, width), small, width);
+                    long err = got > f ? got - f : f - got;
+                    if (err > 1)
+                        throw new InvalidOperationException("坐标往返误差超过 1 帧。");
+                }
+                int lineL, lineR, capL, capR;
+                SpanAbout(endX, 1, width, out lineL, out lineR);
+                SpanAbout(endX, HandleCapW / 2, width, out capL, out capR);
+                if (lineL + lineR != endX * 2 || capL + capR != endX * 2)
+                    throw new InvalidOperationException("白块和竖线没有以同一个点为中心。");
+                if (capL < 0 || capR > width)
+                    throw new InvalidOperationException("末尾白块被窗口切掉了。");
+                if (!NearHandle(width - 1, endX, width, HandleGrab))
+                    throw new InvalidOperationException("贴着右缘点不到末尾把手。");
+                if (!NearHandle(0, margin, width, HandleGrab))
+                    throw new InvalidOperationException("贴着左缘点不到开头把手。");
+                int[] widths = new int[] { 240, 800, 1600 };
+                for (int i = 0; i < widths.Length; i++)
+                {
+                    int ww = widths[i];
+                    int ex = MapX(frames, frames, ww);
+                    int m = PlotMarginOf(ww);
+                    if (ex != ww - m)
+                        throw new InvalidOperationException("拉宽窗口后末尾把手不在内边距上。");
+                    int cl, cr;
+                    SpanAbout(ex, HandleCapW / 2, ww, out cl, out cr);
+                    if (cl < 0 || cr > ww || cl + cr != ex * 2)
+                        throw new InvalidOperationException("拉宽窗口后末尾白块被切掉或偏了。");
+                    if (!NearHandle(ww - 1, ex, ww, HandleGrab))
+                        throw new InvalidOperationException("拉宽窗口后贴边抓不到末尾把手。");
+                }
                 if (PickDrag(true, true, true, false, 10, 10, 80, true, 0, false) != 1)
                     throw new InvalidOperationException("点在白块上却去拖了金线。");
                 if (PickDrag(true, false, true, false, 10, 10, 80, true, 0, false) != 4)

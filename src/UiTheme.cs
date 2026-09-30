@@ -28,6 +28,7 @@ namespace LoopTap
         public static readonly Color Wave = Color.FromArgb(120, 190, 255);
         public static readonly Color Keep = Color.FromArgb(36, 48, 64);
         public static readonly Color Gold = Color.FromArgb(255, 196, 0);
+        public static readonly Color Playhead = Color.FromArgb(255, 92, 48);
         public static readonly Color Playing = Color.FromArgb(255, 204, 64);
         public static readonly Color PlayingText = Color.FromArgb(32, 24, 6);
         public static readonly Color Dim = Color.FromArgb(160, 0, 0, 0);
