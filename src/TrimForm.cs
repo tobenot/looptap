@@ -630,13 +630,13 @@ namespace LoopTap
             bool tail = _scan != null && _scan.AudibleEnd < _info.Frames;
             bool snapped = _scan != null && _start == _scan.AudibleStart && _end == _scan.AudibleEnd;
             if (snapped && head && tail)
-                _hint.Text = "开头和结尾的空白已经留在选区外面（先点了录制、后放的声音）。拖两边可改。";
+                _hint.Text = "开头和结尾的空白已经留在选区外面（先点了录制、后放的声音）。拖顶部白块可改。";
             else if (snapped && head)
-                _hint.Text = "已去掉开头的空白（先点了录制、后放的声音）。拖两边可改。";
+                _hint.Text = "已去掉开头的空白（先点了录制、后放的声音）。拖顶部白块可改。";
             else if (snapped && tail)
-                _hint.Text = "已去掉结尾的空白。拖两边可改。";
+                _hint.Text = "已去掉结尾的空白。拖顶部白块可改。";
             else
-                _hint.Text = "拖两边选择要留下的部分。点选区外会移动最近的一边。";
+                _hint.Text = "拖顶部白块选择要留下的部分。点选区外会移动最近的一边。";
 
             double lead = _start / (double)_info.Rate;
             double tailSec = (_info.Frames - _end) / (double)_info.Rate;
@@ -1055,6 +1055,11 @@ namespace LoopTap
             return string.Format("{0}:{1:00}.{2:000}", m, s, ms);
         }
 
+        public static void SelfCheck()
+        {
+            WavePanel.SelfCheck();
+        }
+
         sealed class WavePanel : Control
         {
             float[] _min;
@@ -1074,6 +1079,8 @@ namespace LoopTap
             long _grabFrame;
             long _grabPhase;
             public float DrawGain = 1f;
+            const int HandleGrab = 10;
+            const int HandleCap = 14;
 
             public event EventHandler RangeChanged;
             public event EventHandler LoopChanged;
@@ -1170,15 +1177,15 @@ namespace LoopTap
                     if (xs > 0) g.FillRectangle(dim, 0, 0, xs, h);
                     if (xe < w) g.FillRectangle(dim, xe, 0, w - xe, h);
                 }
-                DrawGrid(g, w, h);
-                using (Pen handle = new Pen(UiTheme.Gold, 2f))
+                int hs = ShownX(_start);
+                int he = ShownX(_end);
+                using (SolidBrush handle = new SolidBrush(UiTheme.Text))
                 {
-                    int hs = xs;
-                    int he = xe;
-                    if (hs > w - 1) hs = w - 1;
-                    if (he > w - 1) he = w - 1;
-                    g.DrawLine(handle, hs, 0, hs, h - 1);
-                    g.DrawLine(handle, he, 0, he, h - 1);
+                    DrawHandleLine(g, handle, hs, w, h);
+                    DrawHandleLine(g, handle, he, w, h);
+                    DrawGrid(g, w, h);
+                    DrawHandleCap(g, handle, hs, w, h);
+                    DrawHandleCap(g, handle, he, w, h);
                 }
                 if (_play >= 0 && _frames > 0)
                 {
@@ -1194,48 +1201,51 @@ namespace LoopTap
                 base.OnMouseDown(e);
                 if (e.Button != MouseButtons.Left || _frames <= 0) return;
                 Focus();
-                int xs = XAt(_start);
-                int xe = XAt(_end);
-                int grab = 10;
-                bool nearS = Math.Abs(e.X - xs) <= grab;
-                bool nearE = Math.Abs(e.X - xe) <= grab;
-                if (nearS && nearE)
-                    _drag = e.X >= (xs + xe) / 2 ? 2 : 1;
-                else if (nearS)
-                    _drag = 1;
-                else if (nearE)
-                    _drag = 2;
-                else
+                int xs = ShownX(_start);
+                int xe = ShownX(_end);
+                bool nearS = Math.Abs(e.X - xs) <= HandleGrab;
+                bool nearE = Math.Abs(e.X - xe) <= HandleGrab;
+                long gk;
+                bool onGrid = HitGrid(e.X, out gk);
+                bool shift = (Control.ModifierKeys & Keys.Shift) == Keys.Shift;
+                int mode = PickDrag(_grid, e.Y < HandleCap, nearS, nearE, e.X, xs, xe, onGrid, gk, shift);
+                if (mode == 4 || mode == 5)
                 {
-                    long gk;
-                    bool shift = (Control.ModifierKeys & Keys.Shift) == Keys.Shift;
-                    bool onGrid = HitGrid(e.X, out gk);
-                    if (_grid && (onGrid || shift))
-                    {
-                        _drag = (onGrid && gk != 0 && !shift) ? 5 : 4;
-                        _gridK = gk;
-                        _grabFrame = FrameAt(e.X);
-                        _grabPhase = _phase;
-                        Capture = true;
-                        DragGrid(e.X);
-                        return;
-                    }
-                    if (e.X > xs && e.X < xe)
-                    {
-                        _drag = 3;
-                        _bodyOrigin = FrameAt(e.X);
-                        _bodyStart = _start;
-                        _bodyEnd = _end;
-                    }
-                    else
-                        _drag = e.X < xs ? 1 : 2;
+                    _drag = mode;
+                    _gridK = gk;
+                    _grabFrame = FrameAt(e.X);
+                    _grabPhase = _phase;
+                    Capture = true;
+                    DragGrid(e.X);
+                    return;
                 }
 
-                if (_drag == 1) MoveStart(FrameAt(e.X));
-                else if (_drag == 2) MoveEnd(FrameAt(e.X));
+                bool snap = false;
+                if (mode == 1 || mode == 2)
+                    _drag = mode;
+                else if (e.X > xs && e.X < xe)
+                {
+                    _drag = 3;
+                    _bodyOrigin = FrameAt(e.X);
+                    _bodyStart = _start;
+                    _bodyEnd = _end;
+                }
+                else
+                {
+                    _drag = e.X < xs ? 1 : 2;
+                    if (_drag == 1) MoveStart(FrameAt(e.X));
+                    else MoveEnd(FrameAt(e.X));
+                    snap = true;
+                }
+                if (_drag == 1 || _drag == 2)
+                {
+                    _grabFrame = FrameAt(e.X);
+                    _bodyStart = _start;
+                    _bodyEnd = _end;
+                }
                 Capture = true;
                 Invalidate();
-                FireRange();
+                if (snap) FireRange();
             }
 
             protected override void OnMouseMove(MouseEventArgs e)
@@ -1244,14 +1254,14 @@ namespace LoopTap
                 if (_frames <= 0) return;
                 if (_drag == 1)
                 {
-                    MoveStart(FrameAt(e.X));
+                    MoveStart(DragEdge(_bodyStart, _grabFrame, FrameAt(e.X)));
                     Invalidate();
                     FireRange();
                     return;
                 }
                 if (_drag == 2)
                 {
-                    MoveEnd(FrameAt(e.X));
+                    MoveEnd(DragEdge(_bodyEnd, _grabFrame, FrameAt(e.X)));
                     Invalidate();
                     FireRange();
                     return;
@@ -1275,9 +1285,9 @@ namespace LoopTap
                     DragGrid(e.X);
                     return;
                 }
-                int xs = XAt(_start);
-                int xe = XAt(_end);
-                if (Math.Abs(e.X - xs) <= 10 || Math.Abs(e.X - xe) <= 10)
+                int xs = ShownX(_start);
+                int xe = ShownX(_end);
+                if (Math.Abs(e.X - xs) <= HandleGrab || Math.Abs(e.X - xe) <= HandleGrab)
                     Cursor = Cursors.SizeWE;
                 else
                 {
@@ -1325,20 +1335,113 @@ namespace LoopTap
 
             long FrameAt(int x)
             {
-                int w = ClientSize.Width;
-                if (_frames <= 0 || w <= 1) return 0;
-                if (x < 0) x = 0;
-                if (x >= w) return _frames;
-                return x * _frames / w;
+                return MapFrame(x, _frames, ClientSize.Width);
             }
 
             int XAt(long frame)
             {
-                int w = ClientSize.Width;
-                if (_frames <= 0 || w <= 0) return 0;
+                return MapX(frame, _frames, ClientSize.Width);
+            }
+
+            int ShownX(long frame)
+            {
+                return ShownX(frame, _frames, ClientSize.Width);
+            }
+
+            static int MapX(long frame, long frames, int width)
+            {
+                if (frames <= 0 || width <= 0) return 0;
                 if (frame <= 0) return 0;
-                if (frame >= _frames) return w;
-                return (int)(frame * w / _frames);
+                if (frame >= frames) return width;
+                return (int)(frame * width / frames);
+            }
+
+            static int ShownX(long frame, long frames, int width)
+            {
+                int x = MapX(frame, frames, width);
+                if (width <= 1) return 0;
+                if (x < 0) return 0;
+                if (x >= width) return width - 1;
+                return x;
+            }
+
+            static long MapFrame(int x, long frames, int width)
+            {
+                if (frames <= 0 || width <= 1) return 0;
+                if (x < 0) x = 0;
+                if (x >= width) return frames;
+                return (long)x * frames / width;
+            }
+
+            static long DragEdge(long edge, long grabFrame, long pointerFrame)
+            {
+                return edge + (pointerFrame - grabFrame);
+            }
+
+            // 白块（顶部）改选区。白块下面若压着网格，金线/灰线优先，避免和选区抢同一次点击。
+            static int PickDrag(bool gridOn, bool onGrip, bool nearS, bool nearE, int x, int xs, int xe, bool onGrid, long gridK, bool shift)
+            {
+                if (gridOn && !onGrip && (onGrid || shift))
+                    return (onGrid && gridK != 0 && !shift) ? 5 : 4;
+                if (nearS && nearE)
+                    return x >= (xs + xe) / 2 ? 2 : 1;
+                if (nearS) return 1;
+                if (nearE) return 2;
+                return 0;
+            }
+
+            void DrawHandleLine(Graphics g, Brush brush, int x, int w, int h)
+            {
+                if (w <= 1 || h <= 1) return;
+                if (x < 0) x = 0;
+                if (x > w - 1) x = w - 1;
+                int left = x > w - 2 ? w - 2 : x;
+                if (left < 0) left = 0;
+                int lw = left + 2 > w ? w - left : 2;
+                g.FillRectangle(brush, left, 0, lw, h);
+            }
+
+            void DrawHandleCap(Graphics g, Brush brush, int x, int w, int h)
+            {
+                if (w <= 1 || h <= 1) return;
+                if (x < 0) x = 0;
+                if (x > w - 1) x = w - 1;
+                int capW = 10;
+                int capH = HandleCap;
+                if (capH > h) capH = h;
+                int cap = x - capW / 2;
+                if (cap + capW > w) cap = w - capW;
+                if (cap < 0) cap = 0;
+                if (cap + capW > w) capW = w - cap;
+                if (capW > 0 && capH > 0)
+                    g.FillRectangle(brush, cap, 0, capW, capH);
+            }
+
+            public static void SelfCheck()
+            {
+                long frames = 5760000;
+                int width = 800;
+                int shown = ShownX(frames, frames, width);
+                if (shown != width - 1)
+                    throw new InvalidOperationException("文件末尾的手柄没有落在最后一像素。");
+                long under = MapFrame(shown, frames, width);
+                if (under >= frames)
+                    throw new InvalidOperationException("最后一像素不该被当成文件末尾之后。");
+                if (DragEdge(frames, under, under) != frames)
+                    throw new InvalidOperationException("按住末尾手柄却把选区缩短了。");
+                long moved = DragEdge(frames, under, MapFrame(shown - 1, frames, width));
+                if (moved >= frames || moved <= frames / 2)
+                    throw new InvalidOperationException("拖动手柄没有跟着鼠标缩短。");
+                if (PickDrag(true, true, true, false, 10, 10, 80, true, 0, false) != 1)
+                    throw new InvalidOperationException("点在白块上却去拖了金线。");
+                if (PickDrag(true, false, true, false, 10, 10, 80, true, 0, false) != 4)
+                    throw new InvalidOperationException("点在金线上却去拖了选区。");
+                if (PickDrag(true, false, false, false, 40, 10, 80, true, 3, false) != 5)
+                    throw new InvalidOperationException("灰线没有用来改周期。");
+                if (PickDrag(false, false, false, true, 80, 10, 80, false, 0, false) != 2)
+                    throw new InvalidOperationException("没开网格时拖不到结尾手柄。");
+                if (PickDrag(false, false, false, false, 40, 10, 80, false, 0, false) != 0)
+                    throw new InvalidOperationException("选区中间被当成了手柄。");
             }
 
             void FireRange()

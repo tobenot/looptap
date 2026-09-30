@@ -552,6 +552,7 @@ namespace LoopTap
                 RecordingName.SelfCheck();
                 WavWriter.SelfCheck();
                 WavCut.SelfCheck();
+                TrimForm.SelfCheck();
                 Console.WriteLine("selfcheck ok");
                 return 0;
             }
